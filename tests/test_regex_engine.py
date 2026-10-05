@@ -1,0 +1,505 @@
+"""System tests for the frozen public API of ``regex_engine``.
+
+Everything here goes through the documented entry points only:
+``compile``, ``fullmatch``, ``Pattern``, ``Match`` and
+``RegexSyntaxError`` as re-exported by the package.  Private helpers
+(``_parse``, ``_run``, ``_pieces`` ...) are never touched.
+
+The standard-library ``re`` module is deliberately NOT used as an
+oracle: this engine differs from it on purpose (``.`` matches newlines,
+only full matches succeed, and the set of rejected patterns is
+different), so expected results are stated explicitly.
+"""
+
+from __future__ import annotations
+
+import io
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from itertools import product
+
+import regex_engine
+from regex_engine import Match, Pattern, RegexSyntaxError, compile, fullmatch
+
+
+def matched_text(result):
+    """Normalise a match result: None stays None, a Match becomes its text."""
+    return None if result is None else result.group(0)
+
+
+class PublicApiTest(unittest.TestCase):
+    """The package surface stays exactly as documented."""
+
+    def test_exports(self):
+        self.assertEqual(
+            set(regex_engine.__all__),
+            {"__version__", "RegexSyntaxError", "Match", "Pattern",
+             "compile", "fullmatch"},
+        )
+
+    def test_version_string(self):
+        self.assertIsInstance(regex_engine.__version__, str)
+        self.assertEqual(regex_engine.__version__, "0.1.0")
+
+    def test_compile_returns_pattern(self):
+        self.assertIsInstance(compile("a+"), Pattern)
+
+    def test_pattern_repr_and_pattern_attribute(self):
+        p = compile("a+b")
+        self.assertEqual(p.pattern, "a+b")
+        self.assertEqual(repr(p), "<Pattern 'a+b'>")
+
+    def test_syntax_error_is_a_value_error(self):
+        self.assertTrue(issubclass(RegexSyntaxError, ValueError))
+
+
+class EmptyAndLiteralTest(unittest.TestCase):
+    def test_empty_pattern_matches_empty_text(self):
+        m = fullmatch("", "")
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(), "")
+
+    def test_empty_pattern_rejects_nonempty_text(self):
+        self.assertIsNone(fullmatch("", "a"))
+        self.assertIsNone(fullmatch("", " "))
+
+    def test_nonempty_pattern_rejects_empty_text(self):
+        self.assertIsNone(fullmatch("a", ""))
+        self.assertIsNone(fullmatch("abc", ""))
+
+    def test_literal_concatenation(self):
+        self.assertIsNotNone(fullmatch("abc", "abc"))
+        self.assertIsNone(fullmatch("abc", "ab"))     # too short
+        self.assertIsNone(fullmatch("abc", "abcd"))   # too long (fullmatch)
+        self.assertIsNone(fullmatch("abc", "abd"))
+
+    def test_unicode_literals(self):
+        self.assertIsNotNone(fullmatch("héllo", "héllo"))
+        self.assertIsNotNone(fullmatch("日本語", "日本語"))
+        self.assertIsNotNone(fullmatch("🙂🙂", "🙂🙂"))
+        self.assertIsNone(fullmatch("日本語", "日本"))
+        self.assertIsNone(fullmatch("héllo", "hello"))
+
+    def test_bare_closing_brackets_are_literals(self):
+        # A "]" or "}" outside a class/quantifier is an ordinary character.
+        self.assertIsNotNone(fullmatch("]", "]"))
+        self.assertIsNotNone(fullmatch("}", "}"))
+        self.assertIsNone(fullmatch("]", "}"))
+
+
+class DotTest(unittest.TestCase):
+    def test_dot_matches_any_single_character(self):
+        for ch in ("a", "Z", "0", " ", "\t", "🙂"):
+            with self.subTest(ch=ch):
+                self.assertIsNotNone(fullmatch(".", ch))
+
+    def test_dot_matches_newline(self):
+        # Unlike the default of many regex flavours, "." matches "\n" here.
+        self.assertIsNotNone(fullmatch(".", "\n"))
+        self.assertIsNotNone(fullmatch("a.c", "a\nc"))
+
+    def test_dot_consumes_exactly_one_character(self):
+        self.assertIsNone(fullmatch(".", ""))
+        self.assertIsNone(fullmatch(".", "ab"))
+        self.assertIsNotNone(fullmatch("...", "a\nb"))
+
+
+class EscapeTest(unittest.TestCase):
+    def test_escaped_metacharacters_are_literal(self):
+        for escaped, char in [
+            (r"\.", "."), (r"\*", "*"), (r"\+", "+"), (r"\?", "?"),
+            (r"\[", "["), (r"\]", "]"), (r"\{", "{"), (r"\}", "}"),
+            (r"\(", "("), (r"\|", "|"), (r"\\", "\\"),
+        ]:
+            with self.subTest(escaped=escaped):
+                self.assertIsNotNone(fullmatch(escaped, char))
+
+    def test_escaped_metacharacter_loses_special_meaning(self):
+        self.assertIsNone(fullmatch(r"\.", "a"))      # not "any char"
+        self.assertIsNone(fullmatch(r"a\*", "aa"))    # not a quantifier
+        self.assertIsNotNone(fullmatch(r"a\*", "a*"))
+
+    def test_escaped_ordinary_character_is_literal(self):
+        self.assertIsNotNone(fullmatch(r"\a", "a"))
+        self.assertIsNone(fullmatch(r"\a", "b"))
+
+    def test_escape_inside_longer_pattern(self):
+        self.assertIsNotNone(fullmatch(r"a\.txt", "a.txt"))
+        self.assertIsNone(fullmatch(r"a\.txt", "a_txt"))
+
+
+class CharacterClassTest(unittest.TestCase):
+    def test_plain_members(self):
+        for ch in "abc":
+            self.assertIsNotNone(fullmatch("[abc]", ch))
+        self.assertIsNone(fullmatch("[abc]", "d"))
+        self.assertIsNone(fullmatch("[abc]", ""))
+        self.assertIsNone(fullmatch("[abc]", "ab"))
+
+    def test_range(self):
+        self.assertIsNotNone(fullmatch("[a-z]", "m"))
+        self.assertIsNotNone(fullmatch("[a-z]", "a"))
+        self.assertIsNotNone(fullmatch("[a-z]", "z"))
+        self.assertIsNone(fullmatch("[a-z]", "A"))
+        self.assertIsNone(fullmatch("[a-z]", "0"))
+
+    def test_multiple_ranges_and_members(self):
+        self.assertIsNotNone(fullmatch("[a-c0-2_]", "b"))
+        self.assertIsNotNone(fullmatch("[a-c0-2_]", "1"))
+        self.assertIsNotNone(fullmatch("[a-c0-2_]", "_"))
+        self.assertIsNone(fullmatch("[a-c0-2_]", "d"))
+        self.assertIsNone(fullmatch("[a-c0-2_]", "3"))
+
+    def test_negation(self):
+        self.assertIsNone(fullmatch("[^a-z]", "m"))
+        self.assertIsNotNone(fullmatch("[^a-z]", "A"))
+        self.assertIsNotNone(fullmatch("[^abc]", "x"))
+        self.assertIsNone(fullmatch("[^abc]", "b"))
+
+    def test_negated_class_matches_newline(self):
+        self.assertIsNotNone(fullmatch("[^a]", "\n"))
+
+    def test_escapable_members(self):
+        self.assertIsNotNone(fullmatch(r"[\]]", "]"))
+        self.assertIsNotNone(fullmatch(r"[\\]", "\\"))
+        self.assertIsNotNone(fullmatch(r"[\^]", "^"))
+        self.assertIsNotNone(fullmatch(r"[a\-z]", "-"))
+        self.assertIsNone(fullmatch(r"[\]]", "a"))
+
+    def test_dash_at_class_edge_is_literal(self):
+        self.assertIsNotNone(fullmatch("[a-]", "-"))
+        self.assertIsNotNone(fullmatch("[a-]", "a"))
+        self.assertIsNone(fullmatch("[a-]", "b"))
+
+    def test_caret_not_at_start_is_literal(self):
+        self.assertIsNotNone(fullmatch("[a^]", "^"))
+        self.assertIsNotNone(fullmatch("[a^]", "a"))
+
+    def test_unicode_range(self):
+        self.assertIsNotNone(fullmatch("[α-ω]", "β"))
+        self.assertIsNone(fullmatch("[α-ω]", "a"))
+        self.assertIsNotNone(fullmatch("[^α-ω]", "a"))
+        self.assertIsNone(fullmatch("[^α-ω]", "β"))
+
+    def test_class_with_quantifier(self):
+        self.assertIsNotNone(fullmatch("[0-9]+", "40812"))
+        self.assertIsNone(fullmatch("[0-9]+", "408a"))
+        self.assertIsNone(fullmatch("[0-9]+", ""))
+
+
+class QuantifierTest(unittest.TestCase):
+    # (pattern, texts that match, texts that do not)
+    CASES = [
+        ("a?", ["", "a"], ["aa", "b", "ab"]),
+        ("a*", ["", "a", "aaa"], ["b", "ab", "ba"]),
+        ("a+", ["a", "aa", "aaaa"], ["", "b", "aab"]),
+        ("a{0}", [""], ["a", "aa"]),
+        ("a{2}", ["aa"], ["", "a", "aaa"]),
+        ("a{2,}", ["aa", "aaa", "aaaaaa"], ["", "a"]),
+        ("a{0,2}", ["", "a", "aa"], ["aaa"]),
+        ("a{2,4}", ["aa", "aaa", "aaaa"], ["", "a", "aaaaa"]),
+        ("a{3,3}", ["aaa"], ["aa", "aaaa"]),
+        ("ab{2,3}c", ["abbc", "abbbc"], ["abc", "abbbbc", "abbdc"]),
+        (".*", ["", "anything at all", "a\nb\nc"], []),
+        (".+", ["a", "a\nb"], [""]),
+        ("[ab]{2}", ["aa", "ab", "ba", "bb"], ["", "a", "aaa", "ac"]),
+        ("x?y", ["y", "xy"], ["xxy", "x", ""]),
+    ]
+
+    def test_quantifier_bounds(self):
+        for pattern, hits, misses in self.CASES:
+            for text in hits:
+                with self.subTest(pattern=pattern, text=text):
+                    self.assertIsNotNone(fullmatch(pattern, text))
+            for text in misses:
+                with self.subTest(pattern=pattern, text=text):
+                    self.assertIsNone(fullmatch(pattern, text))
+
+    def test_zero_repetitions_of_empty_text(self):
+        self.assertIsNotNone(fullmatch("a*", ""))
+        self.assertIsNotNone(fullmatch("[a-z]*", ""))
+        self.assertIsNotNone(fullmatch("a{0,5}", ""))
+        self.assertIsNone(fullmatch("a+", ""))
+        self.assertIsNone(fullmatch("a{1,}", ""))
+
+    def test_quantified_unicode_atom(self):
+        self.assertIsNotNone(fullmatch("🙂{2}", "🙂🙂"))
+        self.assertIsNone(fullmatch("🙂{2}", "🙂"))
+        self.assertIsNotNone(fullmatch("é+", "ééé"))
+
+
+class BacktrackingTest(unittest.TestCase):
+    """Adjacent quantifiers must share characters via backtracking."""
+
+    def test_backtrack_to_success(self):
+        # a* must give one character back so the trailing atom can match.
+        self.assertIsNotNone(fullmatch("a*a", "a"))
+        self.assertIsNotNone(fullmatch("a*a", "aa"))
+        self.assertIsNotNone(fullmatch("a*ab", "aab"))
+        self.assertIsNotNone(fullmatch("a+ab", "aab"))
+        self.assertIsNotNone(fullmatch(".*a", "bba"))
+        self.assertIsNotNone(fullmatch("[a-z]*[0-9]", "abc1"))
+        self.assertIsNotNone(fullmatch("a{1,3}ab", "aaab"))
+
+    def test_backtrack_to_final_failure(self):
+        # Greedy expansion and every backtracking alternative all fail.
+        self.assertIsNone(fullmatch("a*ab", "aa"))
+        self.assertIsNone(fullmatch("a+ab", "aa"))
+        self.assertIsNone(fullmatch(".*a", "bb"))
+        self.assertIsNone(fullmatch("[a-z]+[0-9]", "abc"))
+        self.assertIsNone(fullmatch("a*a", "b"))
+
+    def test_greedy_still_allows_full_match_only(self):
+        self.assertIsNone(fullmatch("a*", "aab"))
+        self.assertIsNotNone(fullmatch("a.*", "a\n\n"))
+
+
+class PatternReuseTest(unittest.TestCase):
+    def test_success_failure_success_sequence(self):
+        p = compile("a+b")
+        first = p.fullmatch("aab")
+        self.assertIsNotNone(first)
+        self.assertIsNone(p.fullmatch("aa"))       # failure leaves no state
+        second = p.fullmatch("ab")
+        self.assertIsNotNone(second)
+        self.assertEqual(second.group(), "ab")
+        # And the first success is still reproducible afterwards.
+        self.assertIsNotNone(p.fullmatch("aab"))
+
+    def test_interleaved_patterns_do_not_interfere(self):
+        pa = compile("a+")
+        pb = compile("b+")
+        self.assertIsNotNone(pa.fullmatch("aa"))
+        self.assertIsNone(pa.fullmatch("bb"))
+        self.assertIsNotNone(pb.fullmatch("bb"))
+        self.assertIsNone(pb.fullmatch("aa"))
+        self.assertIsNotNone(pa.fullmatch("aaa"))
+
+    def test_pattern_and_text_are_not_mutated(self):
+        source = "a+b"
+        p = compile(source)
+        text = "aab"
+        snapshot = (p.pattern, text)
+        p.fullmatch(text)
+        p.fullmatch("zz")
+        self.assertEqual((p.pattern, text), snapshot)
+
+
+class MatchObjectTest(unittest.TestCase):
+    TEXT = "a\nc"
+
+    def setUp(self):
+        self.match = fullmatch("a.c", self.TEXT)
+        self.assertIsInstance(self.match, Match)
+
+    def test_group_zero_is_the_whole_text(self):
+        self.assertEqual(self.match.group(), self.TEXT)
+        self.assertEqual(self.match.group(0), self.TEXT)
+
+    def test_start_end_span(self):
+        self.assertEqual(self.match.start(), 0)
+        self.assertEqual(self.match.end(), len(self.TEXT))
+        self.assertEqual(self.match.span(), (0, len(self.TEXT)))
+
+    def test_string_attribute(self):
+        self.assertEqual(self.match.string, self.TEXT)
+
+    def test_repr(self):
+        self.assertEqual(repr(self.match), f"<Match {self.TEXT!r}>")
+        self.assertEqual(repr(fullmatch("", "")), "<Match ''>")
+
+    def test_nonzero_group_index_raises_index_error(self):
+        for index in (1, 2, -1, 100):
+            with self.subTest(index=index):
+                with self.assertRaises(IndexError):
+                    self.match.group(index)
+
+
+class EntryPointEquivalenceTest(unittest.TestCase):
+    """fullmatch(p, t) must always equal compile(p).fullmatch(t)."""
+
+    PATTERNS = [
+        "", "a", "b", "ab", "ba", ".", "..", "a.", ".b",
+        "a?", "a*", "a+", "b?", "b*",
+        "a{2}", "b{1,2}", "a{0,2}b",
+        "[ab]", "[^a]", "[a-b]", "[ab]*", "[^b]+",
+        "a*b", "a+b?", ".*b", "[ab]{2}",
+        r"\.", r"a\*", "]",
+    ]
+
+    TEXTS = [""] + [
+        "".join(chars)
+        for length in (1, 2, 3)
+        for chars in product("ab", repeat=length)
+    ] + ["\n", "a\nb", ".", "*", "]", "é"]
+
+    def assert_same_result(self, left, right):
+        if left is None or right is None:
+            self.assertIsNone(left)
+            self.assertIsNone(right)
+        else:
+            self.assertEqual(left.group(0), right.group(0))
+            self.assertEqual(left.span(), right.span())
+            self.assertEqual(left.string, right.string)
+
+    def test_direct_call_matches_compiled_call(self):
+        for pattern in self.PATTERNS:
+            compiled = compile(pattern)
+            for text in self.TEXTS:
+                with self.subTest(pattern=pattern, text=text):
+                    self.assert_same_result(
+                        fullmatch(pattern, text), compiled.fullmatch(text)
+                    )
+
+    def test_results_are_deterministic_across_repeats(self):
+        for pattern in self.PATTERNS:
+            compiled = compile(pattern)
+            for text in self.TEXTS:
+                first = matched_text(compiled.fullmatch(text))
+                for _ in range(2):
+                    with self.subTest(pattern=pattern, text=text):
+                        self.assertEqual(
+                            matched_text(compiled.fullmatch(text)), first
+                        )
+                        self.assertEqual(
+                            matched_text(fullmatch(pattern, text)), first
+                        )
+
+
+class SyntaxErrorTest(unittest.TestCase):
+    # (pattern, expected pos, a fragment of the error message)
+    CASES = [
+        # Unclosed or empty character classes.
+        ("[", 0, "unterminated character class"),
+        ("[ab", 0, "unterminated character class"),
+        ("[a-", 0, "unterminated character class"),
+        ("[]", 0, "empty character class"),
+        ("[^]", 0, "empty character class"),
+        # Reversed range: pos points at the range's lower endpoint.
+        ("[z-a]", 1, "reversed character range"),
+        ("ab[9-0]", 3, "reversed character range"),
+        # Dangling backslash, inside and outside a class.
+        ("\\", 0, "dangling backslash"),
+        ("ab\\", 2, "dangling backslash"),
+        ("[\\", 1, "dangling backslash in character class"),
+        ("[a\\", 2, "dangling backslash in character class"),
+        # Quantifier with no preceding atom.
+        ("*a", 0, "no preceding atom"),
+        ("?a", 0, "no preceding atom"),
+        ("+a", 0, "no preceding atom"),
+        ("{2}a", 0, "no preceding atom"),
+        ("{2,}a", 0, "no preceding atom"),
+        ("{2,3}a", 0, "no preceding atom"),
+        # Repeated quantifiers on one atom.
+        ("a**", 2, "multiple quantifiers"),
+        ("a*?", 2, "multiple quantifiers"),
+        ("a+*", 2, "multiple quantifiers"),
+        ("a??", 2, "multiple quantifiers"),
+        ("a*{2}", 2, "multiple quantifiers"),
+        ("a{2}*", 4, "multiple quantifiers"),
+        ("a{2}{3}", 4, "multiple quantifiers"),
+        # Illegal or unclosed brace bounds.
+        ("a{,2}", 1, "invalid quantifier bounds"),
+        ("a{x}", 1, "invalid quantifier bounds"),
+        ("a{2x}", 1, "invalid quantifier bounds"),
+        ("a{2", 1, "unclosed quantifier bounds"),
+        ("a{2,", 1, "invalid quantifier bounds"),
+        ("a{2,3", 1, "invalid quantifier bounds"),
+        ("a{2,x}", 1, "invalid quantifier bounds"),
+        # Upper bound smaller than lower bound.
+        ("a{3,2}", 1, "upper bound is smaller than lower bound"),
+        ("a{10,2}", 1, "upper bound is smaller than lower bound"),
+        # Groups, alternation and anchors are not supported.
+        ("(a)", 0, "not supported"),
+        ("a(b", 1, "not supported"),
+        ("a)b", 1, "not supported"),
+        ("a|b", 1, "not supported"),
+        ("^a", 0, "anchors are not supported"),
+        ("a$", 1, "anchors are not supported"),
+    ]
+
+    def test_each_bad_pattern_raises_with_position(self):
+        for pattern, pos, fragment in self.CASES:
+            with self.subTest(pattern=pattern):
+                with self.assertRaises(RegexSyntaxError) as ctx:
+                    compile(pattern)
+                exc = ctx.exception
+                self.assertEqual(exc.pos, pos)
+                self.assertIn(fragment, str(exc))
+                self.assertIn(f"position {pos}", str(exc))
+
+    def test_fullmatch_raises_the_same_errors(self):
+        for pattern, pos, _ in self.CASES:
+            with self.subTest(pattern=pattern):
+                with self.assertRaises(RegexSyntaxError) as ctx:
+                    fullmatch(pattern, "anything")
+                self.assertEqual(ctx.exception.pos, pos)
+
+    def test_error_positions_point_into_the_pattern(self):
+        for pattern, pos, _ in self.CASES:
+            self.assertGreaterEqual(pos, 0)
+            self.assertLess(pos, len(pattern))
+
+
+class TypeErrorTest(unittest.TestCase):
+    BAD_VALUES = [None, 0, 1, 3.14, b"a", bytearray(b"a"), ["a"], ("a",), object()]
+
+    def test_non_str_pattern_raises_type_error(self):
+        for value in self.BAD_VALUES:
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(TypeError):
+                    compile(value)
+                with self.assertRaises(TypeError):
+                    fullmatch(value, "a")
+
+    def test_non_str_text_raises_type_error(self):
+        p = compile("a*")
+        for value in self.BAD_VALUES:
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(TypeError):
+                    p.fullmatch(value)
+                with self.assertRaises(TypeError):
+                    fullmatch("a*", value)
+
+    def test_type_error_is_not_a_syntax_error(self):
+        # The two failure channels must stay distinguishable.
+        with self.assertRaises(TypeError) as ctx:
+            compile(None)
+        self.assertNotIsInstance(ctx.exception, RegexSyntaxError)
+
+
+class CommandLineTest(unittest.TestCase):
+    """The existing ``version``/``help`` command line behaviour is frozen."""
+
+    def run_cli(self, *args):
+        from regex_engine.__main__ import main
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(list(args))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_version(self):
+        code, out, err = self.run_cli("version")
+        self.assertEqual(code, 0)
+        self.assertEqual(out, regex_engine.__version__ + "\n")
+        self.assertEqual(err, "")
+
+    def test_help_and_aliases(self):
+        for args in (["help"], ["-h"], ["--help"], []):
+            with self.subTest(args=args):
+                code, out, err = self.run_cli(*args)
+                self.assertEqual(code, 0)
+                self.assertIn("usage:", out)
+                self.assertEqual(err, "")
+
+    def test_unknown_command(self):
+        code, out, err = self.run_cli("bogus")
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("unknown command: bogus", err)
+        self.assertIn("usage:", err)
+
+
+if __name__ == "__main__":
+    unittest.main()
