@@ -1,8 +1,8 @@
-"""Exhaustive greedy-semantics consistency tests for ``regex_engine``.
+"""Exhaustive repetition-mode consistency tests for ``regex_engine``.
 
 This module pins down the *published* matching semantics of the current
-greedy executor on short patterns and short texts, so that a second
-execution path can later be checked against a stable regression baseline.
+executor on short patterns and short texts, so that a second execution
+path can later be checked against a stable regression baseline.
 
 Design notes
 ------------
@@ -10,22 +10,25 @@ Design notes
   of the supported grammar: plain and Unicode literals, ``.`` (which
   matches newlines here), positive/negated character classes, escapes,
   concatenation, empty and nested groups, and the ``?`` ``*`` ``+``
-  ``{m}`` ``{m,}`` ``{m,n}`` quantifiers on atoms and on whole groups.
-  Generation depth, quantifier upper bounds and text length all have
-  small explicit caps, so the case set has the same size, order and
+  ``{m}`` ``{m,}`` ``{m,n}`` quantifiers on atoms and on whole groups,
+  each in greedy, lazy (``?`` suffix) and possessive (``+`` suffix)
+  modes.  Generation depth, quantifier upper bounds and text length all
+  have small explicit caps, so the case set has the same size, order and
   results on every run.  Alternation, anchors, named groups and
   backreferences are never generated: the engine rejects them.
 * Expected results come from an *independent* oracle written in this
   file: its own parser plus a generator-based enumerator that walks the
-  feasible paths in the documented greedy priority (longest first,
-  backtrack by shortening) and takes the first complete match.  It never
-  imports or calls any private parsing/matching helper of
-  ``regex_engine``.  The oracle models the documented capture rules:
-  groups that never participate stay ``None``; a group that participates
-  but matches the empty string keeps its ``(pos, pos)`` span; a repeated
-  group keeps the capture of its last participation (a nested group that
-  skips a later repetition keeps its most recent earlier capture); and
-  captures made by branches that backtracking abandons are rolled back.
+  feasible paths in the documented priority order (greedy: longest
+  first, backtrack by shortening; lazy: fewest repetitions first,
+  extending on failure; possessive: the longest stretch is committed)
+  and takes the first complete match.  It never imports or calls any
+  private parsing/matching helper of ``regex_engine``.  The oracle
+  models the documented capture rules: groups that never participate
+  stay ``None``; a group that participates but matches the empty string
+  keeps its ``(pos, pos)`` span; a repeated group keeps the capture of
+  its last participation (a nested group that skips a later repetition
+  keeps its most recent earlier capture); and captures made by branches
+  that backtracking abandons are rolled back in every mode.
 * Every (pattern, text) case is observed through the public entry points
   only: ``compile(pattern).fullmatch(text)``, ``fullmatch(pattern, text)``
   and a repeated call on the same ``Pattern`` object.  All three must
@@ -49,20 +52,22 @@ from regex_engine import compile, fullmatch
 #
 # The oracle has two parts: a parser for exactly the documented grammar
 # (written from the module docstring, sharing no code with the engine)
-# and a lazy enumerator.  ``_enum_seq``/``_enum_group`` yield
-# ``(end_position, captures)`` pairs in greedy priority order; captures
-# are threaded as immutable tuples, so a branch that is abandoned simply
-# stops yielding -- its captures can never leak into a sibling branch,
-# which is exactly the rollback rule the engine documents.
+# and a generator enumerator.  ``_enum_seq``/``_enum_group`` yield
+# ``(end_position, captures)`` pairs in each piece's mode priority;
+# captures are threaded as immutable tuples, so a branch that is
+# abandoned simply stops yielding -- its captures can never leak into a
+# sibling branch, which is exactly the rollback rule the engine
+# documents.
 # ---------------------------------------------------------------------------
 
 
 class _OracleParser:
     """Recursive-descent parser for the supported pattern subset.
 
-    Produces nested ``pieces`` tuples: each piece is ``(atom, lo, hi)``
-    with ``hi is None`` meaning "unbounded".  An atom is one of
-    ``("lit", ch)``, ``("any",)``,
+    Produces nested ``pieces`` tuples: each piece is
+    ``(atom, lo, hi, mode)`` with ``hi is None`` meaning "unbounded" and
+    ``mode`` one of ``"g"`` (greedy), ``"l"`` (lazy) or ``"p"``
+    (possessive).  An atom is one of ``("lit", ch)``, ``("any",)``,
     ``("cls", negated, chars, ranges)`` or
     ``("grp", group_number, sub_pieces)``.  Group numbers are 1-based in
     left-parenthesis order, as documented.
@@ -95,18 +100,22 @@ class _OracleParser:
 
     def _piece(self):
         atom = self._atom()
-        lo, hi = 1, 1
+        lo, hi, mode = 1, 1, "g"
+        quantified = False
         if self._i < len(self._p):
             c = self._p[self._i]
             if c == "?":
                 lo, hi = 0, 1
                 self._i += 1
+                quantified = True
             elif c == "*":
                 lo, hi = 0, None
                 self._i += 1
+                quantified = True
             elif c == "+":
                 lo, hi = 1, None
                 self._i += 1
+                quantified = True
             elif c == "{":
                 j = self._p.index("}", self._i)
                 body = self._p[self._i + 1 : j]
@@ -117,7 +126,17 @@ class _OracleParser:
                 else:
                     lo = hi = int(body)
                 self._i = j + 1
-        return (atom, lo, hi)
+                quantified = True
+        if quantified and self._i < len(self._p):
+            # One mode marker belongs to the quantifier just parsed.
+            marker = self._p[self._i]
+            if marker == "?":
+                mode = "l"
+                self._i += 1
+            elif marker == "+":
+                mode = "p"
+                self._i += 1
+        return (atom, lo, hi, mode)
 
     def _atom(self):
         c = self._p[self._i]
@@ -199,47 +218,119 @@ def _enum_seq(pieces, index, pos, caps, text):
 
     ``caps`` is a tuple with one slot per group (slot 0 unused); each
     slot is ``None`` or a ``(start, end)`` pair.  Ends are produced in
-    greedy priority order: longest first, shortening on backtracking.
+    the piece's priority order: greedy offers the longest run first,
+    lazy the shortest, and possessive only the committed longest run.
     """
     if index == len(pieces):
         yield pos, caps
         return
-    atom, lo, hi = pieces[index]
+    atom, lo, hi, mode = pieces[index]
     if atom[0] == "grp":
-        for mid, caps1 in _enum_group(atom, lo, hi, pos, 0, caps, text):
+        for mid, caps1 in _enum_group(atom, lo, hi, mode, pos, 0, caps,
+                                      text, allow_stop=True):
             yield from _enum_seq(pieces, index + 1, mid, caps1, text)
         return
-    # Single-character atom: take the longest possible run first, then
-    # offer every shorter count down to the lower bound.
+    # Single-character atom.
     limit = len(text) - pos if hi is None else min(hi, len(text) - pos)
     count = 0
     while count < limit and _atom_matches(atom, text[pos + count]):
         count += 1
-    for take in range(count, lo - 1, -1):
+    if mode == "l":
+        # Shortest first; the range is empty when count < lo.
+        takes = range(lo, count + 1)
+    elif mode == "p":
+        # Commit to the longest run when it meets the minimum.
+        takes = (count,) if count >= lo else ()
+    else:
+        # Longest first; the range is empty when count < lo.
+        takes = range(count, lo - 1, -1)
+    for take in takes:
         yield from _enum_seq(pieces, index + 1, pos + take, caps, text)
 
 
-def _enum_group(atom, lo, hi, base, count, caps, text):
-    """Yield ``(end, caps)`` for one more stretch of ``(sub){lo,hi}``.
+def _enum_group(atom, lo, hi, mode, base, count, caps, text,
+                allow_stop: bool):
+    """Yield ``(end, caps)`` for one stretch of ``(sub){lo,hi}``.
 
     ``count`` repetitions are already committed; the next one starts at
-    ``base``.  Greedy order: for each sub-sequence end (longest first),
-    first try to extend with another repetition, then settle on the
-    current end.  A sub-match that consumes nothing is offered once and
-    stops expansion, so empty-able repeats terminate; the lower bound is
-    waived for that empty match, as documented.
+    ``base``.  The modes differ in priority:
+
+    * greedy: for each sub-sequence end (longest first), extend with
+      another repetition first, then settle on the current end;
+    * lazy: stop at the current count first (subject to the minimum),
+      then enumerate repetitions -- a larger count precedes a shorter
+      end of the same earlier count;
+    * possessive: extend greedily to the longest stretch and offer only
+      that committed end, never shortening it.
+
+    A sub-match that consumes nothing is offered once and stops
+    expansion, so empty-able repeats terminate; the lower bound is
+    waived for that empty match, as documented.  ``allow_stop`` is
+    False for a lazy continuation whose "stop here" was already offered
+    by the enclosing frame, so the same settlement is never yielded
+    twice.
     """
     gid, sub = atom[1], atom[2]
+
+    def stop_here():
+        # Captures return to the entry state, so a stretch that never
+        # participates keeps whatever it captured before (or stays None).
+        if allow_stop and count >= lo:
+            yield base, caps
+
     if hi is not None and count >= hi:
-        yield base, caps
+        yield from stop_here()
         return
+
+    if mode == "p":
+        # Walk to the longest stretch like greedy, but commit it: once a
+        # sub end is chosen, no shorter sub end or count survives.
+        for end, caps1 in _enum_seq(sub, 0, base, caps, text):
+            caps2 = caps1[:gid] + ((base, end),) + caps1[gid + 1 :]
+            if end == base:
+                yield end, caps2
+                return
+            reps = count + 1
+            if hi is None or reps < hi:
+                yield from _enum_group(atom, lo, hi, "p", end, reps,
+                                       caps2, text, allow_stop=True)
+                return
+            yield end, caps2
+            return
+        # Sub offers nothing at this base; stop if the minimum is met.
+        yield from stop_here()
+        return
+
+    if mode == "l":
+        # Priority 1: stop at the current count.
+        yield from stop_here()
+        # For each sub-sequence end (sub's own priority, longest first):
+        # settle at the new count, then extend to still larger counts,
+        # and only then take the next (shorter) sub end.  The extension
+        # frame must not re-offer this frame's stop.
+        for end, caps1 in _enum_seq(sub, 0, base, caps, text):
+            caps2 = caps1[:gid] + ((base, end),) + caps1[gid + 1 :]
+            if end == base:
+                # Frozen empty match; offered once and never expanded.
+                yield end, caps2
+                return
+            reps = count + 1
+            if reps >= lo:
+                yield end, caps2
+            if hi is None or reps < hi:
+                yield from _enum_group(atom, lo, hi, "l", end, reps,
+                                       caps2, text, allow_stop=False)
+        return
+
+    # Greedy.
     for end, caps1 in _enum_seq(sub, 0, base, caps, text):
         caps2 = caps1[:gid] + ((base, end),) + caps1[gid + 1 :]
         if end == base:
             yield end, caps2
             break
         if hi is None or count + 1 < hi:
-            yield from _enum_group(atom, lo, hi, end, count + 1, caps2, text)
+            yield from _enum_group(atom, lo, hi, "g", end, count + 1,
+                                   caps2, text, allow_stop=True)
         if count + 1 >= lo:
             yield end, caps2
     # No (further) repetition: stop here if the minimum is already met.
@@ -324,8 +415,17 @@ def _format_obs(obs):
 
 ATOMS = ("a", "b", "é", "🙂", ".", "\\.", "\\*", "[ab]", "[^a]", "[a-c]", "[^a-cé]")
 QUANTIFIERS = ("", "?", "*", "+", "{2}", "{0,2}", "{1,2}", "{0}", "{2,}")
+# Mode markers appended after a real quantifier: "" keeps it greedy.
+MODE_MARKERS = ("", "?", "+")
 CONCAT_ATOMS = ("a", ".", "[ab]", "[^a]")
 CONCAT_QUANTIFIERS = ("", "?", "*", "+")
+# A bounded set of quantified pieces carrying every repetition mode, for
+# dedicated two-piece mode-interaction grids.
+MODE_PIECES = (
+    "a*?", "a*+", "a+?", "a++", "a??", "a?+",
+    "a{1,2}?", "a{1,2}+", "a{2}?", "a{2}+",
+    "[ab]*?", "[ab]*+", ".+?", ".++",
+)
 GROUP_BODIES = (
     "", "a", "b", ".", "ab", "a.", "a?", "a*", "ba", "[ab]",
     "é", "a(b)", "(a)b", "(a)(b)", "(a?)", "()",
@@ -348,6 +448,20 @@ EXTRA_PATTERNS = (
     "(a){0}", "(a?){0,2}", "((a)b(c))", "(é)(🙂)?",
 )
 
+# Mode-specific boundary shapes: the published lazy/possessive examples
+# and splits only the three strategies distinguish, including empty-able
+# repeats under every mode and markers on brace-bounded groups.
+MODE_EXTRA_PATTERNS = (
+    "a*?a", "a*+a", "a+?a", "a++a", "a??a", "a?+a",
+    "a{2,4}?", "a{2,4}+", "a{0,2}?", "a{0,2}+",
+    "(a*?)(a*)", "(a*+)(a*)", "(a+?)(a*)", "(a++)(a*)",
+    "(a*)(a*?)", "(a*)(a*+)", "(a{1,3}?)(a*)", "(a{1,3}+)(a*)",
+    "(ab){1,}?", "(ab){1,}+", "(ab)*?", "(ab)*+", "(ab)+?", "(ab)++",
+    "(a?)*?", "(a?)*+", "(a*)+?", "(a*)++", "(a*?)*", "(a*+)*",
+    "()*?", "()*+", "()+?", "()++",
+    "a*?b", "a*+b", ".*?a", ".*+a", "[ab]+?b", "[ab]++b",
+)
+
 TEXT_ALPHABET = ("a", "b", "é", "\n")
 EXTRA_TEXTS = (
     "aaa", "aab", "aba", "abb", "baa", "ab\n", "a\nb",
@@ -367,20 +481,28 @@ def _dedupe(items):
 
 def _generate_patterns():
     patterns = []
-    # 1. Every atom under every quantifier.
+    # 1. Every atom under every quantifier and every repetition mode.
     for atom in ATOMS:
         for quant in QUANTIFIERS:
-            patterns.append(atom + quant)
+            if quant:
+                for marker in MODE_MARKERS:
+                    patterns.append(atom + quant + marker)
+            else:
+                patterns.append(atom)
     # 2. Two-piece concatenations (backtracking must share characters).
     pieces = [a + q for a in CONCAT_ATOMS for q in CONCAT_QUANTIFIERS]
     for first in pieces:
         for second in pieces:
             patterns.append(first + second)
     # 3. Groups -- empty, nested, quantified inside -- under every
-    #    quantifier.
+    #    quantifier and every repetition mode.
     for body in GROUP_BODIES:
         for quant in QUANTIFIERS:
-            patterns.append("(" + body + ")" + quant)
+            if quant:
+                for marker in MODE_MARKERS:
+                    patterns.append("(" + body + ")" + quant + marker)
+            else:
+                patterns.append("(" + body + ")")
     # 4. Groups inside concatenations, so captures interact with
     #    surrounding backtracking.
     for prefix in CONTEXT_PREFIXES:
@@ -390,6 +512,13 @@ def _generate_patterns():
                     patterns.append(prefix + "(" + body + ")" + quant + suffix)
     # 5. Hand-picked boundary shapes.
     patterns.extend(EXTRA_PATTERNS)
+    # 6. Two-piece grids whose pieces carry explicit lazy/possessive
+    #    markers, so mode interactions are exhaustively adjacent.
+    for first in MODE_PIECES:
+        for second in MODE_PIECES:
+            patterns.append(first + second)
+    # 7. Hand-picked lazy/possessive boundary shapes.
+    patterns.extend(MODE_EXTRA_PATTERNS)
     return _dedupe(patterns)
 
 
@@ -440,6 +569,20 @@ class OracleSanityTest(unittest.TestCase):
         ("(a)", "b", None),
         ("a*", "aab", None),
         ("a.c", "a\nc", ()),
+        # Lazy and possessive repetitions.
+        ("a*?a", "aaa", ()),
+        ("a*+a", "aaa", None),
+        ("(a*?)(a*)", "aaa", (("", (0, 0)), ("aaa", (0, 3)))),
+        ("(a*+)(a*)", "aaa", (("aaa", (0, 3)), ("", (3, 3)))),
+        ("(a+?)(a*)", "aaa", (("a", (0, 1)), ("aa", (1, 3)))),
+        ("(a++)(a*)", "aaa", (("aaa", (0, 3)), ("", (3, 3)))),
+        ("(ab)*?", "abab", (("ab", (2, 4)),)),
+        ("(ab)*+", "abab", (("ab", (2, 4)),)),
+        ("(a?)*?", "b", None),
+        ("(a?)*+", "b", None),
+        ("(a?)*?b", "b", (None,)),
+        ("(a?)*+b", "b", (("", (0, 0)),)),
+        ("(a*)+?", "aaa", (("aaa", (0, 3)),)),
     ]
 
     def test_oracle_reproduces_known_semantics(self):
@@ -461,9 +604,9 @@ class GenerationDeterminismTest(unittest.TestCase):
     """The case set is bounded, duplicate-free and stable across runs."""
 
     def test_counts_are_fixed(self):
-        self.assertEqual(len(PATTERNS), 744)
+        self.assertEqual(len(PATTERNS), 1398)
         self.assertEqual(len(TEXTS), 35)
-        self.assertEqual(len(CASES), 744 * 35)
+        self.assertEqual(len(CASES), 1398 * 35)
 
     def test_no_duplicates(self):
         self.assertEqual(len(set(PATTERNS)), len(PATTERNS))
@@ -476,6 +619,11 @@ class GenerationDeterminismTest(unittest.TestCase):
         self.assertIn("aab", TEXTS)
         # Zero-width group repeats and competing greedy splits.
         for pattern in ("()*", "(){2}", "(a*)+", "(a?)*", "(a*)(a*)"):
+            self.assertIn(pattern, PATTERNS)
+        # Every repetition mode appears, including the spec examples.
+        for pattern in ("a*?", "a++", "a{2,4}?", "(ab){1,}+",
+                        "a*?a", "a*+a", "(a*?)(a*)", "(a*+)(a*)",
+                        "(a?)*?", "(a?)*+"):
             self.assertIn(pattern, PATTERNS)
         # Newline and non-ASCII coverage in both patterns and texts.
         self.assertIn("\n", TEXTS)
