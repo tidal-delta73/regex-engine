@@ -50,8 +50,14 @@ Supported pattern syntax: literals (Unicode) and concatenation, `.`
 character classes with `a-z` ranges and leading `^` negation, numbered
 capturing groups `(...)` (nestable, empty groups allowed), and the
 postfix quantifiers `?` `*` `+` `{m}` `{m,}` `{m,n}` on atoms or whole
-groups. Alternation, anchors, named groups and backreferences are not
-supported. Only full matches succeed. Invalid patterns raise
+groups. Every quantifier is greedy by default and takes an optional
+mode suffix: a following `?` makes it lazy (fewest repetitions first,
+expanding only while the rest of the pattern cannot complete the
+match) and a following `+` makes it possessive (take the greedy
+maximum once and commit, never shortening it during backtracking) --
+e.g. `a*?`, `a++`, `a{2,4}?`, `(ab){1,}+`. Alternation, anchors,
+named groups and backreferences are not supported. Only full matches
+succeed. Invalid patterns raise
 `RegexSyntaxError` (a `ValueError` subclass) whose `pos` is the
 zero-based offset of the first bad character (the unmatched
 parenthesis for unbalanced groups); non-`str` pattern or text raises

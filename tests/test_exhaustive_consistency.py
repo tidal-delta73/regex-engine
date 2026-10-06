@@ -1,7 +1,7 @@
-"""Exhaustive greedy-semantics consistency tests for ``regex_engine``.
+"""Exhaustive matching-semantics consistency tests for ``regex_engine``.
 
 This module pins down the *published* matching semantics of the current
-greedy executor on short patterns and short texts, so that a second
+executor on short patterns and short texts, so that a second
 execution path can later be checked against a stable regression baseline.
 
 Design notes
@@ -10,15 +10,18 @@ Design notes
   of the supported grammar: plain and Unicode literals, ``.`` (which
   matches newlines here), positive/negated character classes, escapes,
   concatenation, empty and nested groups, and the ``?`` ``*`` ``+``
-  ``{m}`` ``{m,}`` ``{m,n}`` quantifiers on atoms and on whole groups.
+  ``{m}`` ``{m,}`` ``{m,n}`` quantifiers on atoms and on whole groups,
+  each in all three modes (greedy, lazy ``?``, possessive ``+``).
   Generation depth, quantifier upper bounds and text length all have
   small explicit caps, so the case set has the same size, order and
   results on every run.  Alternation, anchors, named groups and
   backreferences are never generated: the engine rejects them.
 * Expected results come from an *independent* oracle written in this
   file: its own parser plus a generator-based enumerator that walks the
-  feasible paths in the documented greedy priority (longest first,
-  backtrack by shortening) and takes the first complete match.  It never
+  feasible paths in the documented priority order of each mode (greedy:
+  longest first, backtrack by shortening; lazy: fewest repetitions
+  first, expanding one at a time; possessive: the greedy maximum,
+  committed) and takes the first complete match.  It never
   imports or calls any private parsing/matching helper of
   ``regex_engine``.  The oracle models the documented capture rules:
   groups that never participate stay ``None``; a group that participates
@@ -49,8 +52,9 @@ from regex_engine import compile, fullmatch
 #
 # The oracle has two parts: a parser for exactly the documented grammar
 # (written from the module docstring, sharing no code with the engine)
-# and a lazy enumerator.  ``_enum_seq``/``_enum_group`` yield
-# ``(end_position, captures)`` pairs in greedy priority order; captures
+# and a lazy enumerator.  ``_enum_seq``/``_enum_group*`` yield
+# ``(end_position, captures)`` pairs in the priority order documented
+# for the piece's mode; captures
 # are threaded as immutable tuples, so a branch that is abandoned simply
 # stops yielding -- its captures can never leak into a sibling branch,
 # which is exactly the rollback rule the engine documents.
@@ -60,8 +64,10 @@ from regex_engine import compile, fullmatch
 class _OracleParser:
     """Recursive-descent parser for the supported pattern subset.
 
-    Produces nested ``pieces`` tuples: each piece is ``(atom, lo, hi)``
-    with ``hi is None`` meaning "unbounded".  An atom is one of
+    Produces nested ``pieces`` tuples: each piece is ``(atom, lo, hi,
+    mode)`` with ``hi is None`` meaning "unbounded" and ``mode`` one of
+    ``"greedy"``, ``"lazy"`` (quantifier followed by ``?``) or
+    ``"possessive"`` (quantifier followed by ``+``).  An atom is one of
     ``("lit", ch)``, ``("any",)``,
     ``("cls", negated, chars, ranges)`` or
     ``("grp", group_number, sub_pieces)``.  Group numbers are 1-based in
@@ -96,6 +102,7 @@ class _OracleParser:
     def _piece(self):
         atom = self._atom()
         lo, hi = 1, 1
+        quantified = True
         if self._i < len(self._p):
             c = self._p[self._i]
             if c == "?":
@@ -117,7 +124,22 @@ class _OracleParser:
                 else:
                     lo = hi = int(body)
                 self._i = j + 1
-        return (atom, lo, hi)
+            else:
+                quantified = False
+        else:
+            quantified = False
+        mode = "greedy"
+        if quantified and self._i < len(self._p):
+            # A "?" or "+" directly after a complete quantifier is its
+            # lazy/possessive modifier, never a new atom.
+            c = self._p[self._i]
+            if c == "?":
+                mode = "lazy"
+                self._i += 1
+            elif c == "+":
+                mode = "possessive"
+                self._i += 1
+        return (atom, lo, hi, mode)
 
     def _atom(self):
         c = self._p[self._i]
@@ -199,27 +221,52 @@ def _enum_seq(pieces, index, pos, caps, text):
 
     ``caps`` is a tuple with one slot per group (slot 0 unused); each
     slot is ``None`` or a ``(start, end)`` pair.  Ends are produced in
-    greedy priority order: longest first, shortening on backtracking.
+    the piece's own priority order: greedy longest-first, lazy
+    shortest-first, possessive committed to the greedy maximum.
     """
     if index == len(pieces):
         yield pos, caps
         return
-    atom, lo, hi = pieces[index]
+    atom, lo, hi, mode = pieces[index]
     if atom[0] == "grp":
-        for mid, caps1 in _enum_group(atom, lo, hi, pos, 0, caps, text):
+        for mid, caps1 in _enum_group(atom, lo, hi, mode, pos, 0, caps, text):
             yield from _enum_seq(pieces, index + 1, mid, caps1, text)
         return
-    # Single-character atom: take the longest possible run first, then
-    # offer every shorter count down to the lower bound.
+    # Single-character atom: greedy takes the longest run first and
+    # offers every shorter count down to the lower bound; lazy offers
+    # counts growing from the lower bound; possessive offers only the
+    # longest run.
     limit = len(text) - pos if hi is None else min(hi, len(text) - pos)
     count = 0
     while count < limit and _atom_matches(atom, text[pos + count]):
         count += 1
-    for take in range(count, lo - 1, -1):
+    if mode == "lazy":
+        takes = range(lo, count + 1)
+    elif mode == "possessive":
+        takes = (count,) if count >= lo else ()
+    else:
+        takes = range(count, lo - 1, -1)
+    for take in takes:
         yield from _enum_seq(pieces, index + 1, pos + take, caps, text)
 
 
-def _enum_group(atom, lo, hi, base, count, caps, text):
+def _enum_group(atom, lo, hi, mode, base, count, caps, text):
+    """Dispatch to the group enumerator for the piece's mode."""
+    if mode == "lazy":
+        yield from _enum_group_lazy(atom, lo, hi, base, count, caps, text)
+        return
+    if mode == "possessive":
+        # Take the greedy maximum and commit: only the first offer of
+        # the greedy enumeration is ever presented.
+        for end, caps1 in _enum_group_greedy(
+                atom, lo, hi, base, count, caps, text):
+            yield end, caps1
+            return
+        return
+    yield from _enum_group_greedy(atom, lo, hi, base, count, caps, text)
+
+
+def _enum_group_greedy(atom, lo, hi, base, count, caps, text):
     """Yield ``(end, caps)`` for one more stretch of ``(sub){lo,hi}``.
 
     ``count`` repetitions are already committed; the next one starts at
@@ -239,7 +286,8 @@ def _enum_group(atom, lo, hi, base, count, caps, text):
             yield end, caps2
             break
         if hi is None or count + 1 < hi:
-            yield from _enum_group(atom, lo, hi, end, count + 1, caps2, text)
+            yield from _enum_group_greedy(
+                atom, lo, hi, end, count + 1, caps2, text)
         if count + 1 >= lo:
             yield end, caps2
     # No (further) repetition: stop here if the minimum is already met.
@@ -247,6 +295,29 @@ def _enum_group(atom, lo, hi, base, count, caps, text):
     # this stretch keeps whatever it captured before (or stays None).
     if count >= lo:
         yield base, caps
+
+
+def _enum_group_lazy(atom, lo, hi, base, count, caps, text):
+    """Yield ``(end, caps)`` for a lazy stretch of ``(sub){lo,hi}``.
+
+    Lazy order: the fewest repetitions first -- settle at the committed
+    count (once the minimum is met) before trying one more repetition.
+    Each repetition's sub-sequence is enumerated in its own priority
+    order.  A sub-match that consumes nothing is offered once and stops
+    expansion, so empty-able repeats terminate; the lower bound is
+    waived for that empty match, as documented.
+    """
+    gid, sub = atom[1], atom[2]
+    if count >= lo:
+        yield base, caps
+    if hi is not None and count >= hi:
+        return
+    for end, caps1 in _enum_seq(sub, 0, base, caps, text):
+        caps2 = caps1[:gid] + ((base, end),) + caps1[gid + 1 :]
+        if end == base:
+            yield end, caps2
+            return
+        yield from _enum_group_lazy(atom, lo, hi, end, count + 1, caps2, text)
 
 
 def _oracle_caps(pattern, text):
@@ -323,21 +394,23 @@ def _format_obs(obs):
 # ---------------------------------------------------------------------------
 
 ATOMS = ("a", "b", "é", "🙂", ".", "\\.", "\\*", "[ab]", "[^a]", "[a-c]", "[^a-cé]")
-QUANTIFIERS = ("", "?", "*", "+", "{2}", "{0,2}", "{1,2}", "{0}", "{2,}")
+QUANTIFIERS = ("", "?", "*", "+", "{2}", "{0,2}", "{1,2}", "{0}", "{2,}",
+               "??", "*?", "+?", "{1,2}?", "{2,}?",
+               "?+", "*+", "++", "{1,2}+", "{2,}+")
 CONCAT_ATOMS = ("a", ".", "[ab]", "[^a]")
-CONCAT_QUANTIFIERS = ("", "?", "*", "+")
+CONCAT_QUANTIFIERS = ("", "?", "*", "+", "*?", "*+")
 GROUP_BODIES = (
     "", "a", "b", ".", "ab", "a.", "a?", "a*", "ba", "[ab]",
     "é", "a(b)", "(a)b", "(a)(b)", "(a?)", "()",
 )
 CONTEXT_PREFIXES = ("", "a", "a?")
 CONTEXT_BODIES = ("", "a", "ab", "a?", "a*")
-CONTEXT_QUANTIFIERS = ("", "?", "*", "+")
+CONTEXT_QUANTIFIERS = ("", "?", "*", "+", "*?", "*+")
 CONTEXT_SUFFIXES = ("", "b", "b?", ".*")
 
 # Hand-picked shapes the cross products above do not reach: deeper
 # nesting, zero-width repeats, competing greedy splits, brace bounds on
-# concatenations and Unicode groups.
+# concatenations, Unicode groups and mode modifiers on groups.
 EXTRA_PATTERNS = (
     "((a))", "((a)*)", "((a*)*)", "((a*)+)", "(a(b))", "(a(b)?)",
     "(a(b)?)*", "((a+)b)+", "((a)(b))", "(a(b)c)?", "((()))",
@@ -346,6 +419,11 @@ EXTRA_PATTERNS = (
     "([ab]+)(x)?", "(a(b)?)*.", "(a*)(a*)?", "(())*",
     "a{2}b{2}", "a{0,2}b", "a{1,2}b{0,2}", ".{2}a", "(ab){2,}",
     "(a){0}", "(a?){0,2}", "((a)b(c))", "(é)(🙂)?",
+    "(a*?)(a*)", "(a*+)(a*)", "(a+?)(a+)", "(a??)(a?)", "(a?+)(a?)",
+    "(a){1,3}?a", "(a){1,3}a", "(a){1,3}+a", "a*?a", "a*+a",
+    "(a*)*?", "(a*)*+", "(a*)+?", "(a*)++", "()*?", "()*+",
+    "(a*?)*", "(a*+)*", "((a*)*?)", "(a(b)?)*?", "(a(b)?)*+",
+    "(a?){2,}?", "(a?){2,}+", "(ab){1,}?", "(ab){1,}+ab",
 )
 
 TEXT_ALPHABET = ("a", "b", "é", "\n")
@@ -440,6 +518,18 @@ class OracleSanityTest(unittest.TestCase):
         ("(a)", "b", None),
         ("a*", "aab", None),
         ("a.c", "a\nc", ()),
+        # Lazy and possessive modes, anchored to the documented rules.
+        ("(a*?)(a*)", "aaa", (("", (0, 0)), ("aaa", (0, 3)))),
+        ("(a*+)(a*)", "aaa", (("aaa", (0, 3)), ("", (3, 3)))),
+        ("a*?a", "aaa", ()),
+        ("a*+a", "aaa", None),
+        ("a*+a", "a", None),
+        ("(a){1,3}?a", "aaa", (("a", (1, 2)),)),
+        ("(a){1,3}a", "aaa", (("a", (1, 2)),)),
+        ("(a*)+?", "aaa", (("aaa", (0, 3)),)),
+        ("(a*)++a", "aaa", None),
+        ("(a*)*?", "aaa", (("aaa", (0, 3)),)),
+        ("(a*)*+", "aaa", (("", (3, 3)),)),
     ]
 
     def test_oracle_reproduces_known_semantics(self):
@@ -461,9 +551,9 @@ class GenerationDeterminismTest(unittest.TestCase):
     """The case set is bounded, duplicate-free and stable across runs."""
 
     def test_counts_are_fixed(self):
-        self.assertEqual(len(PATTERNS), 744)
+        self.assertEqual(len(PATTERNS), 1459)
         self.assertEqual(len(TEXTS), 35)
-        self.assertEqual(len(CASES), 744 * 35)
+        self.assertEqual(len(CASES), 1459 * 35)
 
     def test_no_duplicates(self):
         self.assertEqual(len(set(PATTERNS)), len(PATTERNS))
@@ -476,6 +566,9 @@ class GenerationDeterminismTest(unittest.TestCase):
         self.assertIn("aab", TEXTS)
         # Zero-width group repeats and competing greedy splits.
         for pattern in ("()*", "(){2}", "(a*)+", "(a?)*", "(a*)(a*)"):
+            self.assertIn(pattern, PATTERNS)
+        # Lazy and possessive modes, on atoms and on empty-able groups.
+        for pattern in ("a*?", "a*+", "(a*)*?", "(a*)*+", "(a*?)(a*)"):
             self.assertIn(pattern, PATTERNS)
         # Newline and non-ASCII coverage in both patterns and texts.
         self.assertIn("\n", TEXTS)
@@ -505,7 +598,7 @@ class ExhaustiveConsistencyTest(unittest.TestCase):
                 actual = _observe(match)
                 if actual != expected:
                     self.fail(
-                        "greedy semantics mismatch\n"
+                        "matching semantics mismatch\n"
                         f"  pattern:  {ascii(pattern)}\n"
                         f"  text:     {ascii(text)}\n"
                         f"  entry:    {entry}\n"

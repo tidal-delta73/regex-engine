@@ -7,6 +7,9 @@ Supported syntax (fullmatch only):
   * character classes: [abc], [a-z], [^...]; ], -, ^ and \\ are escapable
   * numbered capturing groups: (...), nestable; empty groups are legal
   * postfix quantifiers ? * + {m} {m,} {m,n}, on atoms or whole groups
+  * quantifier modes: a complete quantifier may be followed by "?"
+    (lazy: fewest repetitions first) or "+" (possessive: take the
+    greedy maximum once and never give characters back)
 
 Alternation, anchors, named groups and backreferences are rejected at
 compile time.
@@ -20,6 +23,8 @@ _INF = float("inf")
 _DIGITS = frozenset("0123456789")
 _QUANTIFIER_STARTS = frozenset("?*+{")
 _SIMPLE_BOUNDS = {"?": (0, 1), "*": (0, _INF), "+": (1, _INF)}
+# A "?" or "+" directly after a complete quantifier selects its mode.
+_MODES = {"?": "lazy", "+": "possessive"}
 
 
 class RegexSyntaxError(ValueError):
@@ -159,19 +164,33 @@ def _parse_plain_atom(pattern: str, i: int):
 
 
 def _attach_piece(pattern: str, i: int, atom, pieces: list) -> int:
-    """Consume the quantifier following ``atom`` and append the piece."""
+    """Consume the quantifier following ``atom`` and append the piece.
+
+    A complete quantifier may be followed by one mode modifier ("?" for
+    lazy, "+" for possessive); the modifier belongs to that quantifier
+    and is not a new atom.  Any further unescaped quantifier start after
+    the quantifier (and its modifier) is an error positioned at that
+    extra character.
+    """
     n = len(pattern)
     lo, hi = 1, 1
+    mode = "greedy"
     if i < n and pattern[i] in _SIMPLE_BOUNDS:
         lo, hi = _SIMPLE_BOUNDS[pattern[i]]
         i += 1
+        if i < n and pattern[i] in _MODES:
+            mode = _MODES[pattern[i]]
+            i += 1
         if i < n and pattern[i] in _QUANTIFIER_STARTS:
             _error("multiple quantifiers on one atom", i)
     elif i < n and pattern[i] == "{":
         lo, hi, i = _parse_braces(pattern, i)
+        if i < n and pattern[i] in _MODES:
+            mode = _MODES[pattern[i]]
+            i += 1
         if i < n and pattern[i] in _QUANTIFIER_STARTS:
             _error("multiple quantifiers on one atom", i)
-    pieces.append((atom, lo, hi))
+    pieces.append((atom, lo, hi, mode))
     return i
 
 
@@ -230,17 +249,23 @@ def _parse(pattern: str):
 # capture of its most recent earlier participation.
 #
 # S ("sequence") frames walk a list of pieces.  Every processed piece
-# leaves a record: ("A", start, count) for a single-character atom already
-# stretched to its greedy count, or ("G", frame) for a suspended group
-# enumerator.  Backtracking pops records: atom records are shortened by
-# one, group records are resumed to offer their next shorter end.
+# leaves a record: ("A", start, count, maxcount, mode) for a
+# single-character atom, or ("G", frame) for a suspended group
+# enumerator.  Backtracking pops records: a greedy atom record is
+# shortened by one, a lazy atom record is grown by one (up to the
+# feasible maximum scanned on entry), a possessive atom record is
+# committed and offers no alternative, and a group record is resumed to
+# offer its next end in the group's own priority order.
 #
-# G ("group") frames are pure enumerators for one piece (sub){lo,hi} at a
-# fixed base position.  They yield successive end positions, longest
-# first, and (via the snapshots) present the correct captures for each;
-# they never consume the pieces following the group -- the parent S frame
-# does.  A sub-sequence that matches the empty string stops expansion at
-# once, so empty-able repeats terminate instead of looping.
+# G ("group") frames are pure enumerators for one piece (sub){lo,hi} at
+# a fixed base position; they never consume the pieces following the
+# group -- the parent S frame does.  The mode selects the enumeration:
+# greedy frames yield successive end positions longest first, lazy
+# frames offer the fewest repetitions first and expand one repetition
+# at a time, and possessive frames run the greedy enumeration but
+# commit to its first offer.  A sub-sequence that matches the empty
+# string stops expansion at once in every mode, so empty-able repeats
+# terminate instead of looping.
 # ---------------------------------------------------------------------------
 
 
@@ -268,6 +293,12 @@ _G_EXT = "ext"        # the one-more-repetition child enumerator is open
 _G_SETTLE = "settle"  # yielded the current repetition's end; shorten sub
 _G_EMPTY = "empty"    # yielded one empty match; fall back to no repetition
 _G_FINAL = "final"    # yielded "stop without another repetition"; done
+# Lazy G phases: the minimum is offered before any expansion.
+_G_LSTART = "lstart"      # fresh entry; offer the minimum first
+_G_LSETTLED = "lsettled"  # minimum offered; expand on the next drive
+_G_LSUB = "lsub"          # the sub-sequence enumerator is open
+_G_LEXT = "lext"          # the one-more-repetition child enumerator is open
+_G_LEMPTY = "lempty"      # yielded one empty match; nothing more to offer
 
 
 class _Runner:
@@ -287,11 +318,13 @@ class _Runner:
         # ["S", pieces, pos, records, phase, gframe]
         return ["S", pieces, pos, [], _S_RUN, None]
 
-    def _group_frame(self, pieces, k: int, pos: int, count: int, entry):
+    def _group_frame(self, pieces, k: int, pos: int, count: int, entry,
+                     mode: str):
         # ["G", pieces, k, base, count, phase, subf, extf,
-        #  entry, repstate, sub_end]
-        return ["G", pieces, k, pos, count, _G_SUB, None, None,
-                entry, entry, pos]
+        #  entry, repstate, sub_end, mode, yielded]
+        phase = _G_LSTART if mode == "lazy" else _G_SUB
+        return ["G", pieces, k, pos, count, phase, None, None,
+                entry, entry, pos, mode, False]
 
     # -- S frame ------------------------------------------------------------
 
@@ -303,16 +336,26 @@ class _Runner:
                 f[5] = gframe
                 f[4] = _S_WAIT
                 return ("push", gframe)
-            _, start, count = records.pop()
+            _, start, count, maxcount, mode = records.pop()
             pieces = f[1]
             j = len(records)
             lo = pieces[j][1]
-            count -= 1
-            if count >= lo:
-                records.append(("A", start, count))
-                f[2] = start + count
-                f[4] = _S_RUN
-                return "again"
+            if mode == "lazy":
+                # Grow towards the feasible maximum one character at a time.
+                count += 1
+                if count <= maxcount:
+                    records.append(("A", start, count, maxcount, mode))
+                    f[2] = start + count
+                    f[4] = _S_RUN
+                    return "again"
+            elif mode == "greedy":
+                count -= 1
+                if count >= lo:
+                    records.append(("A", start, count, maxcount, mode))
+                    f[2] = start + count
+                    f[4] = _S_RUN
+                    return "again"
+            # possessive: the count is committed and offers no alternative
         f[4] = _S_END
         return "fail"
 
@@ -335,7 +378,7 @@ class _Runner:
             if k == len(pieces):
                 f[4] = _S_END
                 return ("yield", pos)
-            atom, lo, hi = pieces[k]
+            atom, lo, hi, mode = pieces[k]
             if atom[0] != "grp":
                 start = pos
                 count = 0
@@ -348,20 +391,40 @@ class _Runner:
                     count += 1
                 if count < lo:
                     return self._s_backtrack(f)
-                records.append(("A", start, count))
-                f[2] = pos
+                maxcount = count
+                if mode == "lazy":
+                    # Start at the minimum; backtracking grows the run.
+                    count = lo
+                records.append(("A", start, count, maxcount, mode))
+                f[2] = start + count
                 continue
             f[4] = _S_WAIT
             f[5] = None
             entry = self._snap()
             return ("push",
-                    self._group_frame(pieces, k, pos, 0, entry))
+                    self._group_frame(pieces, k, pos, 0, entry, mode))
 
     # -- G frame ------------------------------------------------------------
 
     def _step_g(self, f, event):
+        mode = f[11]
+        if mode == "lazy":
+            return self._step_g_lazy(f, event)
+        if mode == "possessive":
+            # Greedy enumeration, but only its first (longest) offer is
+            # ever presented: once yielded, the choice is committed and
+            # the frame has no alternative.
+            if event[0] == "drive" and f[12]:
+                return "fail"
+            action = self._step_g_greedy(f, event)
+            if isinstance(action, tuple) and action[0] == "yield":
+                f[12] = True
+            return action
+        return self._step_g_greedy(f, event)
+
+    def _step_g_greedy(self, f, event):
         (_, pieces, k, base, count, phase, subf, extf,
-         entry, repstate, sub_end) = f
+         entry, repstate, sub_end) = f[:11]
         gid, sub = pieces[k][0][1]
         lo, hi = pieces[k][1], pieces[k][2]
 
@@ -441,7 +504,7 @@ class _Runner:
             return ("yield", end)
         if count + 1 < hi:
             ext = self._group_frame(
-                pieces, k, end, count + 1, self._snap())
+                pieces, k, end, count + 1, self._snap(), "greedy")
             f[7] = ext
             f[5] = _G_EXT
             return ("push", ext)
@@ -449,6 +512,71 @@ class _Runner:
         # match available as the next alternative.
         f[5] = _G_SETTLE
         return ("yield", end)
+
+    def _step_g_lazy(self, f, event):
+        # Lazy enumeration: offer the fewest repetitions first, then
+        # expand one repetition at a time.  Each extension frame repeats
+        # the same policy, so "settle, then grow" applies at every count.
+        (_, pieces, k, base, count, phase, subf, extf,
+         entry, repstate, sub_end) = f[:11]
+        gid, sub = pieces[k][0][1]
+        lo, hi = pieces[k][1], pieces[k][2]
+
+        if event[0] == "drive":
+            if phase == _G_LSTART and count >= lo:
+                # Fewest repetitions first.
+                self._restore(entry)
+                f[5] = _G_LSETTLED
+                return ("yield", base)
+            if phase in (_G_LSTART, _G_LSETTLED):
+                # The minimum is not met yet, or the settled offer was
+                # rejected: try one more repetition.
+                if count >= hi:
+                    return "fail"
+                child = self._seq_frame(sub, base)
+                f[6] = child
+                f[5] = _G_LSUB
+                return ("push", child)
+            if phase == _G_LEXT:
+                return ("push", extf)
+            # _G_LEMPTY: the empty match was the last alternative (the
+            # settle, when allowed, was already offered before it).
+            self._restore(entry)
+            return "fail"
+
+        if phase == _G_LEXT:
+            if event[0] == "fail":
+                # The extension is exhausted; offer the next end of the
+                # current repetition, restoring the state sub produced.
+                self._restore(repstate)
+                f[5] = _G_LSUB
+                return ("push", subf)
+            f[7] = event[2]
+            return ("yield", event[1])
+
+        # phase == _G_LSUB
+        if event[0] == "fail":
+            # No further repetition can start here; the settle was
+            # already offered first, so the enumeration is done.
+            self._restore(entry)
+            return "fail"
+        end = event[1]
+        f[6] = event[2]
+        f[9] = self._snap()
+        f[10] = end
+        self.caps[gid] = (base, end)
+        if end == base:
+            # Empty match: offer it once and stop expanding, so a lazy
+            # repeat of an empty-able sub-expression still terminates.
+            f[5] = _G_LEMPTY
+            return ("yield", end)
+        # The extension frame offers count + 1 repetitions (settling
+        # first, then expanding) before this level's next sub end.
+        ext = self._group_frame(
+            pieces, k, end, count + 1, self._snap(), "lazy")
+        f[7] = ext
+        f[5] = _G_LEXT
+        return ("push", ext)
 
     # -- driver -------------------------------------------------------------
 

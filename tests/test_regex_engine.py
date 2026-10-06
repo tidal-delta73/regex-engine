@@ -254,6 +254,163 @@ class BacktrackingTest(unittest.TestCase):
         self.assertIsNotNone(fullmatch("a.*", "a\n\n"))
 
 
+class QuantifierModeTest(unittest.TestCase):
+    """Lazy (``?``) and possessive (``+``) suffixes on any quantifier."""
+
+    def test_every_quantifier_takes_a_lazy_suffix(self):
+        for pattern in ("a??", "a*?", "a+?", "a{2}?", "a{2,}?", "a{2,4}?",
+                        "(ab)??", "(ab)*?", "(ab)+?", "(ab){1,}?"):
+            with self.subTest(pattern=pattern):
+                self.assertIsInstance(compile(pattern), Pattern)
+
+    def test_every_quantifier_takes_a_possessive_suffix(self):
+        for pattern in ("a?+", "a*+", "a++", "a{2}+", "a{2,}+", "a{2,4}+",
+                        "(ab)?+", "(ab)*+", "(ab)++", "(ab){1,}+"):
+            with self.subTest(pattern=pattern):
+                self.assertIsInstance(compile(pattern), Pattern)
+
+    def test_modifier_belongs_to_the_quantifier_not_a_new_atom(self):
+        # "a*?" is lazy a*, not a* followed by a "?" atom.
+        self.assertIsNotNone(fullmatch("a*?", ""))
+        self.assertIsNotNone(fullmatch("a*?", "aaa"))
+        self.assertIsNone(fullmatch("a*?", "a?"))
+        # "a*+" is possessive a*, not a* followed by a "+" atom.
+        self.assertIsNotNone(fullmatch("a*+", "aaa"))
+        self.assertIsNone(fullmatch("a*+", "a+"))
+
+    def test_lazy_matches_the_same_texts_as_greedy(self):
+        # Only the priority order differs, never the acceptance set.
+        for pattern, hits, misses in [
+            ("a??", ["", "a"], ["aa", "b"]),
+            ("a*?", ["", "a", "aaa"], ["b", "ab", "ba"]),
+            ("a+?", ["a", "aa", "aaaa"], ["", "b"]),
+            ("a{2}?", ["aa"], ["", "a", "aaa"]),
+            ("a{2,4}?", ["aa", "aaa", "aaaa"], ["", "a", "aaaaa"]),
+            ("(ab){1,2}?", ["ab", "abab"], ["", "ababab"]),
+        ]:
+            for text in hits:
+                with self.subTest(pattern=pattern, text=text):
+                    self.assertIsNotNone(fullmatch(pattern, text))
+            for text in misses:
+                with self.subTest(pattern=pattern, text=text):
+                    self.assertIsNone(fullmatch(pattern, text))
+
+    def test_possessive_matches_the_same_texts_as_greedy_alone(self):
+        # Without a competing suffix, possessive accepts what greedy does.
+        for pattern, hits, misses in [
+            ("a?+", ["", "a"], ["aa", "b"]),
+            ("a*+", ["", "a", "aaa"], ["b", "ab"]),
+            ("a++", ["a", "aa"], ["", "b"]),
+            ("a{2,4}+", ["aa", "aaa", "aaaa"], ["", "a", "aaaaa"]),
+            ("(ab){1,}+", ["ab", "abab"], ["", "a"]),
+        ]:
+            for text in hits:
+                with self.subTest(pattern=pattern, text=text):
+                    self.assertIsNotNone(fullmatch(pattern, text))
+            for text in misses:
+                with self.subTest(pattern=pattern, text=text):
+                    self.assertIsNone(fullmatch(pattern, text))
+
+    def test_lazy_expands_only_when_the_remainder_fails(self):
+        self.assertIsNotNone(fullmatch("a*?a", "aaa"))
+        self.assertIsNotNone(fullmatch("a*?a", "a"))
+        self.assertIsNone(fullmatch("a*?a", "b"))
+        # The first complete match in lazy priority order wins.
+        m = fullmatch("(a*?)(a*)", "aaa")
+        self.assertEqual(m.groups(), ("", "aaa"))
+        self.assertEqual(m.span(1), (0, 0))
+        self.assertEqual(m.span(2), (0, 3))
+        m = fullmatch("(a*?)(a*)", "a")
+        self.assertEqual(m.groups(), ("", "a"))
+
+    def test_lazy_group_repetitions(self):
+        # A lazy repeat settles after one repetition; a greedy repeat of
+        # an empty-able sub keeps expanding into a final empty capture.
+        m = fullmatch("(a*)+?", "aaa")
+        self.assertEqual(m.group(1), "aaa")
+        self.assertEqual(m.span(1), (0, 3))
+        m = fullmatch("(a*)+", "aaa")
+        self.assertEqual(m.group(1), "")
+        self.assertEqual(m.span(1), (3, 3))
+        self.assertIsNotNone(fullmatch("(ab){1,}?c", "abc"))
+        self.assertIsNotNone(fullmatch("(ab){1,}?c", "ababc"))
+        self.assertIsNone(fullmatch("(ab){1,}?c", "ab"))
+        self.assertIsNone(fullmatch("(ab){1,}?c", "abac"))
+
+    def test_possessive_never_gives_characters_back(self):
+        # Greedy succeeds by shortening; possessive commits and fails.
+        self.assertIsNotNone(fullmatch("a*a", "aaa"))
+        self.assertIsNone(fullmatch("a*+a", "aaa"))
+        self.assertIsNone(fullmatch("a*+a", "a"))
+        self.assertIsNone(fullmatch("a++a", "aa"))
+        self.assertIsNone(fullmatch(".*+a", "bbba"))
+        self.assertIsNone(fullmatch("[ab]*+b", "aab"))
+        # Greedy shortens a bounded run for the suffix; possessive cannot.
+        self.assertIsNotNone(fullmatch("a{2,4}a", "aaaa"))
+        self.assertIsNone(fullmatch("a{2,4}+a", "aaaa"))
+
+    def test_possessive_group_captures_the_committed_maximum(self):
+        m = fullmatch("(a*+)(a*)", "aaa")
+        self.assertEqual(m.groups(), ("aaa", ""))
+        self.assertEqual(m.span(1), (0, 3))
+        self.assertEqual(m.span(2), (3, 3))
+        # A greedy group repeat would shorten for the suffix; possessive
+        # may not shorten the count or pick a shorter group end.
+        self.assertIsNotNone(fullmatch("(a*)+a", "aaa"))
+        self.assertIsNone(fullmatch("(a*)++a", "aaa"))
+        self.assertIsNone(fullmatch("(ab){1,}+ab", "ababab"))
+
+    def test_lazy_captures_follow_lazy_priority(self):
+        # The lazy group takes the minimum; the greedy one the rest.
+        m = fullmatch("(a+?)(a+)", "aaa")
+        self.assertEqual(m.groups(), ("a", "aa"))
+        # Possessive inside a group commits before the next piece runs.
+        m = fullmatch("(a++)(a*)", "aaa")
+        self.assertEqual(m.groups(), ("aaa", ""))
+
+    def test_empty_able_groups_terminate_in_all_modes(self):
+        for pattern in ("(a*)*?", "(a*)*+", "(a*)+?", "(a*)++",
+                        "(a?)*?", "(a?)*+", "(a?){2,}?", "(a?){2,}+",
+                        "()*?", "()*+", "(){2}?", "(){2}+"):
+            for text in ("", "a", "aaa"):
+                with self.subTest(pattern=pattern, text=text):
+                    # Must terminate; acceptance differs per pattern.
+                    fullmatch(pattern, text)
+        self.assertIsNotNone(fullmatch("(a*)*?", ""))
+        self.assertIsNotNone(fullmatch("(a*)*+", ""))
+        self.assertIsNotNone(fullmatch("(a*)+?", ""))
+        self.assertIsNotNone(fullmatch("(a*)++", ""))
+
+    def test_escaped_modifier_characters_stay_literal(self):
+        self.assertIsNotNone(fullmatch(r"\?", "?"))
+        self.assertIsNotNone(fullmatch(r"\+", "+"))
+        self.assertIsNotNone(fullmatch(r"a*\?", "aaa?"))
+        self.assertIsNotNone(fullmatch(r"a*\+", "aaa+"))
+        self.assertIsNone(fullmatch(r"a*\?", "aaa"))
+        # An escaped "?" is an atom, so a following "*" quantifies it.
+        self.assertIsNotNone(fullmatch(r"\?*", "???"))
+        self.assertIsNotNone(fullmatch(r"a\?+", "a??"))
+
+    def test_character_class_does_not_recognise_modifiers(self):
+        self.assertIsNotNone(fullmatch("[?+]", "?"))
+        self.assertIsNotNone(fullmatch("[?+]", "+"))
+        self.assertIsNotNone(fullmatch("[a?]*", "a?a?"))
+        self.assertIsNotNone(fullmatch("[*+]{2}", "*+"))
+        self.assertIsNone(fullmatch("[?+]", "a"))
+
+    def test_compiled_patterns_with_modifiers_reuse_cleanly(self):
+        lazy = compile("(a*?)(a*)")
+        self.assertEqual(lazy.fullmatch("aaa").groups(), ("", "aaa"))
+        self.assertIsNone(lazy.fullmatch("b"))
+        self.assertEqual(lazy.fullmatch("aa").groups(), ("", "aa"))
+        poss = compile("(a*+)(a*)")
+        self.assertEqual(poss.fullmatch("aaa").groups(), ("aaa", ""))
+        self.assertIsNone(poss.fullmatch("ab"))
+        # Interleaved reuse does not pollute either pattern.
+        self.assertEqual(lazy.fullmatch("aaa").groups(), ("", "aaa"))
+        self.assertEqual(poss.fullmatch("aaa").groups(), ("aaa", ""))
+
+
 class PatternReuseTest(unittest.TestCase):
     def test_success_failure_success_sequence(self):
         p = compile("a+b")
@@ -324,6 +481,8 @@ class EntryPointEquivalenceTest(unittest.TestCase):
         "a{2}", "b{1,2}", "a{0,2}b",
         "[ab]", "[^a]", "[a-b]", "[ab]*", "[^b]+",
         "a*b", "a+b?", ".*b", "[ab]{2}",
+        "a*?", "a+?", "a??", "a*+", "a++", "a{1,2}?", "a{1,2}+",
+        "a*?b", "a*+b", "(a*?)(a*)", "(a*+)(a*)", "(ab){1,2}?", "(ab){1,2}+",
         r"\.", r"a\*", "]",
     ]
 
@@ -392,12 +551,22 @@ class SyntaxErrorTest(unittest.TestCase):
         ("{2,3}a", 0, "no preceding atom"),
         # Repeated quantifiers on one atom.
         ("a**", 2, "multiple quantifiers"),
-        ("a*?", 2, "multiple quantifiers"),
         ("a+*", 2, "multiple quantifiers"),
-        ("a??", 2, "multiple quantifiers"),
         ("a*{2}", 2, "multiple quantifiers"),
         ("a{2}*", 4, "multiple quantifiers"),
         ("a{2}{3}", 4, "multiple quantifiers"),
+        # A quantifier start after a complete quantifier plus its lazy
+        # or possessive modifier: pos points at the extra character.
+        ("a*??", 3, "multiple quantifiers"),
+        ("a*?*", 3, "multiple quantifiers"),
+        ("a*?{2}", 3, "multiple quantifiers"),
+        ("a*++", 3, "multiple quantifiers"),
+        ("a*+?", 3, "multiple quantifiers"),
+        ("a??*", 3, "multiple quantifiers"),
+        ("a?+?", 3, "multiple quantifiers"),
+        ("a{2}??", 5, "multiple quantifiers"),
+        ("a{2}+*", 5, "multiple quantifiers"),
+        ("a{2,4}?{3}", 7, "multiple quantifiers"),
         # Illegal or unclosed brace bounds.
         ("a{,2}", 1, "invalid quantifier bounds"),
         ("a{x}", 1, "invalid quantifier bounds"),
@@ -425,8 +594,10 @@ class SyntaxErrorTest(unittest.TestCase):
         ("(a))", 3, "unbalanced parenthesis"),
         # Quantifiers still need an atom, including right after "(" or ")".
         ("(?)", 1, "no preceding atom"),
-        ("(a)*?", 4, "multiple quantifiers"),
         ("(a){", 3, "invalid quantifier bounds"),
+        # The extra quantifier start after a group's quantifier modifier.
+        ("(a)*??", 5, "multiple quantifiers"),
+        ("(a){2}+?", 7, "multiple quantifiers"),
     ]
 
     def test_each_bad_pattern_raises_with_position(self):
@@ -722,6 +893,8 @@ class GroupReuseAndEquivalenceTest(unittest.TestCase):
             "(a)", "(ab)+", "(a*)(a*)", "a(b)?c", "((a)(b))",
             "(a(b)?)*", "(x)?y", "(a*)+", "()*", "([0-9]+)(x)?",
             "(ab){2}", "(a?)(b?)", "(..)(..)",
+            "(a*?)(a*)", "(a*+)(a*)", "(a+?)(a+)", "(ab){1,2}?",
+            "(ab){1,2}+", "(a*)*?", "(a*)*+", "(a(b)?)*?", "(a(b)?)*+",
         ]
         texts = ["", "a", "ab", "aa", "aaa", "abab", "ac", "xy",
                  "aba", "12x", "abcd", "éé"]
