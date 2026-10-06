@@ -409,13 +409,24 @@ class SyntaxErrorTest(unittest.TestCase):
         # Upper bound smaller than lower bound.
         ("a{3,2}", 1, "upper bound is smaller than lower bound"),
         ("a{10,2}", 1, "upper bound is smaller than lower bound"),
-        # Groups, alternation and anchors are not supported.
-        ("(a)", 0, "not supported"),
-        ("a(b", 1, "not supported"),
-        ("a)b", 1, "not supported"),
-        ("a|b", 1, "not supported"),
+        # Alternation and anchors are still not supported.
+        ("a|b", 1, "alternation is not supported"),
+        ("(a|b)", 2, "alternation is not supported"),
         ("^a", 0, "anchors are not supported"),
         ("a$", 1, "anchors are not supported"),
+        # Unbalanced groups: pos points at the offending parenthesis.
+        ("(", 0, "unbalanced parenthesis"),
+        ("(a", 0, "unbalanced parenthesis"),
+        ("a(b", 1, "unbalanced parenthesis"),
+        ("((a)", 0, "unbalanced parenthesis"),
+        ("(a(b)", 0, "unbalanced parenthesis"),
+        (")", 0, "unbalanced parenthesis"),
+        ("a)b", 1, "unbalanced parenthesis"),
+        ("(a))", 3, "unbalanced parenthesis"),
+        # Quantifiers still need an atom, including right after "(" or ")".
+        ("(?)", 1, "no preceding atom"),
+        ("(a)*?", 4, "multiple quantifiers"),
+        ("(a){", 3, "invalid quantifier bounds"),
     ]
 
     def test_each_bad_pattern_raises_with_position(self):
@@ -466,6 +477,268 @@ class TypeErrorTest(unittest.TestCase):
         with self.assertRaises(TypeError) as ctx:
             compile(None)
         self.assertNotIsInstance(ctx.exception, RegexSyntaxError)
+
+
+class GroupSyntaxTest(unittest.TestCase):
+    """Groups parse, nest and take quantifiers; brackets are balanced."""
+
+    def test_plain_group_matches(self):
+        self.assertIsNotNone(fullmatch("(a)", "a"))
+        self.assertIsNone(fullmatch("(a)", "b"))
+        self.assertIsNone(fullmatch("(a)", "ab"))
+        self.assertIsNone(fullmatch("(a)", ""))
+
+    def test_empty_group(self):
+        m = fullmatch("()", "")
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), "")
+        self.assertEqual(m.start(1), 0)
+        self.assertEqual(m.end(1), 0)
+        self.assertEqual(m.span(1), (0, 0))
+
+    def test_group_inside_concatenation(self):
+        self.assertIsNotNone(fullmatch("a(bc)d", "abcd"))
+        self.assertIsNone(fullmatch("a(bc)d", "abd"))
+
+    def test_nested_groups_numbered_by_left_paren(self):
+        m = fullmatch("((a)(b))", "ab")
+        self.assertEqual(m.groups(), ("ab", "a", "b"))
+        self.assertEqual(m.span(1), (0, 2))
+        self.assertEqual(m.span(2), (0, 1))
+        self.assertEqual(m.span(3), (1, 2))
+
+    def test_deeply_nested_empty_groups(self):
+        m = fullmatch("((()))", "")
+        self.assertEqual(m.groups(), ("", "", ""))
+        for i in (1, 2, 3):
+            self.assertEqual(m.span(i), (0, 0))
+
+    def test_group_quantifiers_match(self):
+        for pattern, hits, misses in [
+            ("(ab)?", ["", "ab"], ["a", "abab"]),
+            ("(ab)*", ["", "ab", "abab"], ["a", "aba"]),
+            ("(ab)+", ["ab", "abab"], ["", "a"]),
+            ("(ab){2}", ["abab"], ["", "ab", "ababab"]),
+            ("(ab){1,2}", ["ab", "abab"], ["", "ababab"]),
+            ("(ab){0,1}", ["", "ab"], ["abab"]),
+        ]:
+            for text in hits:
+                with self.subTest(pattern=pattern, text=text):
+                    self.assertIsNotNone(fullmatch(pattern, text))
+            for text in misses:
+                with self.subTest(pattern=pattern, text=text):
+                    self.assertIsNone(fullmatch(pattern, text))
+
+    def test_quantifiers_inside_groups(self):
+        self.assertIsNotNone(fullmatch("(a+bc)", "aaabc"))
+        self.assertIsNone(fullmatch("(a+bc)", "bc"))
+        self.assertIsNotNone(fullmatch("([0-9]+-[0-9]+)", "12-9"))
+
+    def test_classes_and_escapes_around_groups(self):
+        self.assertIsNotNone(fullmatch(r"(\()", "("))
+        self.assertIsNotNone(fullmatch(r"(\))", ")"))
+        self.assertIsNotNone(fullmatch("([ab]+)", "abba"))
+        self.assertIsNone(fullmatch("([ab]+)", "abc"))
+
+    def test_unbalanced_groups_raise_at_the_opening_paren(self):
+        for pattern, pos in [
+            ("(", 0), ("(a", 0), ("a(b", 1), ("((a)", 0), ("(a(b)", 0),
+            ("()(", 2),
+        ]:
+            with self.subTest(pattern=pattern):
+                with self.assertRaises(RegexSyntaxError) as ctx:
+                    compile(pattern)
+                self.assertEqual(ctx.exception.pos, pos)
+                self.assertIn("unbalanced parenthesis", str(ctx.exception))
+
+    def test_extra_closing_paren_raises_at_it(self):
+        for pattern, pos in [(")", 0), ("a)b", 1), ("(a))", 3), (")(", 0)]:
+            with self.subTest(pattern=pattern):
+                with self.assertRaises(RegexSyntaxError) as ctx:
+                    compile(pattern)
+                self.assertEqual(ctx.exception.pos, pos)
+                self.assertIn("unbalanced parenthesis", str(ctx.exception))
+
+    def test_alternation_and_anchors_still_rejected(self):
+        for pattern, pos in [("(a|b)", 2), ("a|b", 1),
+                             ("(^a)", 1), ("(a$)", 2)]:
+            with self.subTest(pattern=pattern):
+                with self.assertRaises(RegexSyntaxError) as ctx:
+                    compile(pattern)
+                self.assertEqual(ctx.exception.pos, pos)
+
+
+class GroupCaptureTest(unittest.TestCase):
+    """Captured substrings, spans and the groups() tuple."""
+
+    def test_group_returns_captured_text(self):
+        m = fullmatch("a(bc)d", "abcd")
+        self.assertEqual(m.group(1), "bc")
+        self.assertEqual(m.group(0), "abcd")
+        self.assertEqual(m.group(), "abcd")
+
+    def test_groups_tuple_order(self):
+        m = fullmatch("(a)(b)(c)", "abc")
+        self.assertEqual(m.groups(), ("a", "b", "c"))
+
+    def test_groups_empty_when_no_groups(self):
+        self.assertEqual(fullmatch("abc", "abc").groups(), ())
+        self.assertEqual(fullmatch("", "").groups(), ())
+
+    def test_start_end_span_unicode_offsets(self):
+        m = fullmatch("(..)x", "é🙂x")
+        self.assertEqual(m.group(1), "é🙂")
+        self.assertEqual(m.start(1), 0)
+        self.assertEqual(m.end(1), 2)
+        self.assertEqual(m.span(1), (0, 2))
+        m2 = fullmatch("あ(い)う", "あいう")
+        self.assertEqual(m2.span(1), (1, 2))
+
+    def test_optional_group_absent(self):
+        m = fullmatch("a(b)?c", "ac")
+        self.assertIsNone(m.group(1))
+        self.assertEqual(m.start(1), -1)
+        self.assertEqual(m.end(1), -1)
+        self.assertEqual(m.span(1), (-1, -1))
+        self.assertEqual(m.groups(), (None,))
+
+    def test_optional_group_present(self):
+        m = fullmatch("a(b)?c", "abc")
+        self.assertEqual(m.group(1), "b")
+        self.assertEqual(m.span(1), (1, 2))
+
+    def test_group_participating_but_matching_empty_string(self):
+        m = fullmatch("a()b", "ab")
+        self.assertEqual(m.group(1), "")
+        self.assertEqual(m.start(1), 1)
+        self.assertEqual(m.end(1), 1)
+        self.assertEqual(m.span(1), (1, 1))
+
+    def test_zero_repetition_group_is_absent_not_empty(self):
+        m = fullmatch("(ab)*", "")
+        self.assertIsNone(m.group(1))
+        self.assertEqual(m.span(1), (-1, -1))
+
+    def test_last_participation_is_kept_in_a_repeat(self):
+        m = fullmatch("(ab)+", "abab")
+        self.assertEqual(m.group(1), "ab")
+        self.assertEqual(m.span(1), (2, 4))
+        self.assertEqual(fullmatch("(a)+", "aaa").group(1), "a")
+        self.assertEqual(fullmatch("(ab){3}", "ababab").group(1), "ab")
+
+    def test_greedy_split_between_two_groups(self):
+        m = fullmatch("(a*)(a*)", "aa")
+        self.assertEqual(m.group(1), "aa")
+        self.assertEqual(m.group(2), "")
+        self.assertEqual(m.span(1), (0, 2))
+        self.assertEqual(m.span(2), (2, 2))
+
+    def test_nested_capture_in_repeat(self):
+        m = fullmatch("((a+)b)+", "aabab")
+        self.assertEqual(m.group(1), "ab")
+        self.assertEqual(m.group(2), "a")
+        self.assertEqual(m.span(1), (3, 5))
+
+    def test_absent_nested_group_keeps_last_participation(self):
+        m = fullmatch("(a(b)?)*", "aba")
+        self.assertEqual(m.group(1), "a")
+        self.assertEqual(m.group(2), "b")
+
+    def test_absent_nested_group_is_none_when_never_participated(self):
+        m = fullmatch("(a(b)?)*", "aaa")
+        self.assertEqual(m.group(1), "a")
+        self.assertIsNone(m.group(2))
+
+    def test_backtracking_restores_captures(self):
+        # The outer group gives characters back; its earlier captures revert.
+        m = fullmatch("(a(b)?)*.b", "abab")
+        self.assertEqual(m.group(1), "ab")
+        self.assertEqual(m.group(2), "b")
+        self.assertEqual(m.span(1), (0, 2))
+        # A whole optional group abandoned by backtracking leaves no capture.
+        m2 = fullmatch("(a(b)c)?a*", "aa")
+        self.assertIsNone(m2.group(1))
+        self.assertIsNone(m2.group(2))
+
+    def test_group_backtracks_for_following_atom(self):
+        m = fullmatch("(a*)a", "aaa")
+        self.assertEqual(m.group(1), "aa")
+        self.assertEqual(m.span(1), (0, 2))
+
+    def test_empty_repeat_does_not_hang_and_stops(self):
+        m = fullmatch("(a*)+", "aaa")
+        self.assertEqual(m.group(1), "")
+        self.assertEqual(m.span(1), (3, 3))
+        self.assertEqual(fullmatch("(a?)*", "a").group(1), "")
+        self.assertEqual(fullmatch("()*", "").group(1), "")
+        self.assertEqual(fullmatch("(){2}", "").group(1), "")
+        self.assertEqual(fullmatch("(a*){2}", "a").span(1), (1, 1))
+
+    def test_empty_repeat_with_real_suffix(self):
+        m = fullmatch("()*a", "a")
+        self.assertEqual(m.group(1), "")
+        self.assertEqual(m.span(1), (0, 0))
+
+    def test_invalid_group_index_raises_index_error(self):
+        m = fullmatch("(a)", "a")
+        for index in (-1, -2, 2, 100):
+            with self.subTest(index=index):
+                with self.assertRaises(IndexError):
+                    m.group(index)
+                with self.assertRaises(IndexError):
+                    m.start(index)
+                with self.assertRaises(IndexError):
+                    m.end(index)
+                with self.assertRaises(IndexError):
+                    m.span(index)
+        m0 = fullmatch("abc", "abc")
+        for index in (-1, 1, 2):
+            with self.subTest(index=index):
+                with self.assertRaises(IndexError):
+                    m0.group(index)
+
+    def test_string_and_repr_unchanged(self):
+        m = fullmatch("(a)(b)", "ab")
+        self.assertEqual(m.string, "ab")
+        self.assertEqual(repr(m), "<Match 'ab'>")
+
+
+class GroupReuseAndEquivalenceTest(unittest.TestCase):
+    """Compiled patterns reuse cleanly and both entry points agree."""
+
+    def test_failure_does_not_pollute_later_match(self):
+        p = compile("(a+)(b)?")
+        ok = p.fullmatch("aaab")
+        self.assertEqual(ok.groups(), ("aaa", "b"))
+        self.assertIsNone(p.fullmatch("zzz"))
+        again = p.fullmatch("aaa")
+        self.assertEqual(again.group(1), "aaa")
+        self.assertIsNone(again.group(2))
+        once_more = p.fullmatch("aaab")
+        self.assertEqual(once_more.groups(), ("aaa", "b"))
+
+    def test_entry_points_agree_with_groups(self):
+        patterns = [
+            "(a)", "(ab)+", "(a*)(a*)", "a(b)?c", "((a)(b))",
+            "(a(b)?)*", "(x)?y", "(a*)+", "()*", "([0-9]+)(x)?",
+            "(ab){2}", "(a?)(b?)", "(..)(..)",
+        ]
+        texts = ["", "a", "ab", "aa", "aaa", "abab", "ac", "xy",
+                 "aba", "12x", "abcd", "éé"]
+        for pattern in patterns:
+            compiled = compile(pattern)
+            for text in texts:
+                with self.subTest(pattern=pattern, text=text):
+                    direct = fullmatch(pattern, text)
+                    reused = compiled.fullmatch(text)
+                    if direct is None or reused is None:
+                        self.assertIsNone(direct)
+                        self.assertIsNone(reused)
+                    else:
+                        self.assertEqual(direct.groups(), reused.groups())
+                        for i in range(len(direct.groups()) + 1):
+                            self.assertEqual(direct.span(i), reused.span(i))
+                        self.assertEqual(direct.group(0), reused.group(0))
 
 
 class CommandLineTest(unittest.TestCase):
