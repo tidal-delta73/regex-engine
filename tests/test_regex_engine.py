@@ -315,6 +315,116 @@ class MatchObjectTest(unittest.TestCase):
                     self.match.group(index)
 
 
+class GroupTest(unittest.TestCase):
+    def test_simple_group_captures(self):
+        m = fullmatch("(abc)", "abc")
+        self.assertEqual(m.group(0), "abc")
+        self.assertEqual(m.group(1), "abc")
+        self.assertEqual(m.groups(), ("abc",))
+
+    def test_group_numbering_is_left_to_right_by_open_paren(self):
+        m = fullmatch("(a(b))(c)", "abc")
+        self.assertEqual(m.groups(), ("ab", "b", "c"))
+
+    def test_nested_groups(self):
+        m = fullmatch("((a)(b))c", "abc")
+        self.assertEqual(m.groups(), ("ab", "a", "b"))
+        self.assertEqual(m.span(1), (0, 2))
+        self.assertEqual(m.span(2), (0, 1))
+        self.assertEqual(m.span(3), (1, 2))
+
+    def test_empty_group_is_legal(self):
+        m = fullmatch("()a()", "a")
+        self.assertEqual(m.groups(), ("", ""))
+        self.assertEqual(m.span(1), (0, 0))
+        self.assertEqual(m.span(2), (1, 1))
+
+    def test_group_spans_are_unicode_offsets(self):
+        m = fullmatch("(hé)(日.)", "hé日本")
+        self.assertEqual(m.group(1), "hé")
+        self.assertEqual(m.span(1), (0, 2))
+        self.assertEqual(m.group(2), "日本")
+        self.assertEqual(m.span(2), (2, 4))
+        self.assertEqual(m.span(0), (0, 4))
+
+    def test_unmatched_optional_group(self):
+        m = fullmatch("(a)?b", "b")
+        self.assertIsNone(m.group(1))
+        self.assertEqual(m.groups(), (None,))
+        self.assertEqual(m.start(1), -1)
+        self.assertEqual(m.end(1), -1)
+        self.assertEqual(m.span(1), (-1, -1))
+
+    def test_participating_but_empty_group(self):
+        m = fullmatch("(a*)b", "b")
+        self.assertEqual(m.group(1), "")
+        self.assertEqual(m.span(1), (0, 0))
+
+    def test_unknown_group_index_raises_index_error(self):
+        m = fullmatch("(a)", "a")
+        for index in (2, 3, -1, -2, 100):
+            with self.subTest(index=index):
+                with self.assertRaises(IndexError):
+                    m.group(index)
+                with self.assertRaises(IndexError):
+                    m.start(index)
+                with self.assertRaises(IndexError):
+                    m.end(index)
+                with self.assertRaises(IndexError):
+                    m.span(index)
+
+    def test_group_with_quantifiers(self):
+        self.assertEqual(fullmatch("(ab)+", "abab").group(1), "ab")
+        self.assertEqual(fullmatch("(ab)*", "").group(1), None)
+        self.assertEqual(fullmatch("(ab)?(cd)", "cd").groups(), (None, "cd"))
+        self.assertEqual(fullmatch("(ab){2}", "abab").group(1), "ab")
+        self.assertEqual(fullmatch("(ab){2,3}", "ababab").group(1), "ab")
+        self.assertIsNone(fullmatch("(ab){2}", "ab"))
+        self.assertIsNone(fullmatch("(ab)+", "aba"))
+
+    def test_last_repetition_wins(self):
+        self.assertEqual(fullmatch("(ab)+", "abab").group(1), "ab")
+        self.assertEqual(fullmatch("(a)+", "aaa").group(1), "a")
+        self.assertEqual(fullmatch("((a)b)+", "abab").groups(), ("ab", "a"))
+
+    def test_backtracking_restores_captures(self):
+        # (a*) must yield one character so the trailing "a" can match.
+        m = fullmatch("(a*)(a*)", "aa")
+        self.assertEqual(m.groups(), ("aa", ""))
+        m = fullmatch("(a*)a", "aa")
+        self.assertEqual(m.group(1), "a")
+        m = fullmatch("(a+)(a+)", "aaa")
+        self.assertEqual(m.groups(), ("aa", "a"))
+
+    def test_nullable_repetition_does_not_hang(self):
+        self.assertEqual(fullmatch("(a*)*", "aa").group(1), "")
+        self.assertEqual(fullmatch("(a*)*", "").group(1), "")
+        self.assertEqual(fullmatch("(a*)+", "").group(1), "")
+        self.assertEqual(fullmatch("()*", "").group(1), "")
+        self.assertEqual(fullmatch("(a*){2}", "aa").group(1), "")
+        self.assertIsNone(fullmatch("(a*)*", "aab"))
+
+    def test_groups_inside_classes_and_escapes_stay_literal(self):
+        self.assertIsNotNone(fullmatch("[(]", "("))
+        self.assertIsNotNone(fullmatch(r"\(", "("))
+        self.assertIsNotNone(fullmatch(r"\)", ")"))
+
+    def test_failed_match_does_not_pollute_pattern(self):
+        p = compile("(a+)(b)?")
+        self.assertEqual(p.fullmatch("aab").groups(), ("aa", "b"))
+        self.assertIsNone(p.fullmatch("bb"))
+        self.assertEqual(p.fullmatch("aab").groups(), ("aa", "b"))
+        self.assertEqual(p.fullmatch("aa").groups(), ("aa", None))
+
+    def test_group_zero_still_whole_text(self):
+        m = fullmatch("(a)(b)", "ab")
+        self.assertEqual(m.group(), "ab")
+        self.assertEqual(m.group(0), "ab")
+        self.assertEqual(m.span(), (0, 2))
+        self.assertEqual(m.string, "ab")
+        self.assertEqual(repr(m), "<Match 'ab'>")
+
+
 class EntryPointEquivalenceTest(unittest.TestCase):
     """fullmatch(p, t) must always equal compile(p).fullmatch(t)."""
 
@@ -325,6 +435,9 @@ class EntryPointEquivalenceTest(unittest.TestCase):
         "[ab]", "[^a]", "[a-b]", "[ab]*", "[^b]+",
         "a*b", "a+b?", ".*b", "[ab]{2}",
         r"\.", r"a\*", "]",
+        "(a)", "(a)(b)", "(a*)", "(a*)b", "((a)b)", "(a(b))",
+        "(ab)+", "(ab)*", "(a+)(a+)", "(a?)(b?)",
+        "(a){2}", "(ab){1,2}", "()(a)", "(a*)*",
     ]
 
     TEXTS = [""] + [
@@ -341,6 +454,7 @@ class EntryPointEquivalenceTest(unittest.TestCase):
             self.assertEqual(left.group(0), right.group(0))
             self.assertEqual(left.span(), right.span())
             self.assertEqual(left.string, right.string)
+            self.assertEqual(left.groups(), right.groups())
 
     def test_direct_call_matches_compiled_call(self):
         for pattern in self.PATTERNS:
@@ -409,10 +523,16 @@ class SyntaxErrorTest(unittest.TestCase):
         # Upper bound smaller than lower bound.
         ("a{3,2}", 1, "upper bound is smaller than lower bound"),
         ("a{10,2}", 1, "upper bound is smaller than lower bound"),
-        # Groups, alternation and anchors are not supported.
-        ("(a)", 0, "not supported"),
-        ("a(b", 1, "not supported"),
-        ("a)b", 1, "not supported"),
+        # Unbalanced parentheses.
+        ("(", 0, "unclosed '('"),
+        ("(a", 0, "unclosed '('"),
+        ("a(b", 1, "unclosed '('"),
+        ("((a)", 0, "unclosed '('"),
+        ("((a", 1, "unclosed '('"),
+        (")", 0, "unmatched ')'"),
+        ("a)b", 1, "unmatched ')'"),
+        ("(a))", 3, "unmatched ')'"),
+        # Alternation and anchors are not supported.
         ("a|b", 1, "not supported"),
         ("^a", 0, "anchors are not supported"),
         ("a$", 1, "anchors are not supported"),
