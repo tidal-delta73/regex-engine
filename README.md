@@ -9,7 +9,18 @@ Pure-Python, no runtime dependencies.
 ```bash
 python3 -m regex_engine version
 python3 -m regex_engine help
+python3 -m regex_engine fullmatch PATTERN TEXT
 ```
+
+`fullmatch` compiles PATTERN and fullmatches it against TEXT. On a match it
+prints one compact JSON line with `matched` (true), `groups` (group 0
+onward; non-participating groups are `null`, empty matches are `""`) and
+`spans` (Unicode code-point offsets; `[-1,-1]` for non-participating
+groups), and exits 0. A valid pattern that does not match prints
+`{"matched":false,"groups":null,"spans":null}` and exits 1. An invalid
+pattern writes `{"error":...,"message":...,"pos":...}` to stderr with
+empty stdout and exits 2; wrong argument counts print the usage text to
+stderr and exit 2.
 
 ## Python API
 
